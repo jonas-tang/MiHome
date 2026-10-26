@@ -12,6 +12,7 @@ import json
 
 from app.core import _json_store
 from app.core.models import DeviceInfo
+from app.core.service import parse_parent_link
 
 # 版本 3：修正多键面板虚拟子设备的开关记忆。
 # 旧版把"读不到状态"也记成 None（None 的语义是"确认无开关能力"），
@@ -45,6 +46,16 @@ def load() -> tuple[list[DeviceInfo], dict[str, bool | None], dict[str, str]] | 
         devices = [DeviceInfo(**item) for item in items]
     except TypeError:
         return None
+    # 版本 3 的缓存没有父子字段（DeviceInfo 后加的）。就地按 did 形态补上，
+    # 不因此作废整个缓存：断网时列表仍要能显示，只是网关子机（proxy.*）
+    # 这类看不出后缀的会在下次刷新前先当成独立设备。
+    for device in devices:
+        if not device.parent_did:
+            parent, siid, kind = parse_parent_link(device.did)
+            if parent:
+                device.parent_did = parent
+                device.parent_siid = siid
+                device.parent_kind = kind
     known_raw = raw.get("known_power")
     known: dict[str, bool | None] = {}
     if isinstance(known_raw, dict):

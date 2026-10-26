@@ -32,7 +32,7 @@ from mijiaAPI import (
 from mijiaAPI.devices import DevAction, DevProp
 from mijiaAPI.miutils import generate_enc_params, gen_nonce, get_signed_nonce
 
-from . import icon_store, spec_zh
+from . import icon_store, product_name_store, spec_zh
 from .models import ActionInfo, DeviceDetail, DeviceInfo, PropInfo, SceneInfo
 from .net_guard import install_default_timeout
 
@@ -48,8 +48,50 @@ logger = logging.getLogger(__name__)
 _BATCH_SIZE = 20
 # 虚拟子设备的 did 后缀：<父did>.sN，N 为该路对应的 siid
 _SUB_DEVICE_SUFFIX = re.compile(r"\.s(\d+)$")
+# 网关代理子设备的 did 形态：proxy.<父did>.<序号>（如空调网关下的每台内机）。
+# 与 .sN 不同，这类子机没有"第几路"的概念，本身有完整的 on 属性
+_PROXY_DID = re.compile(r"^proxy\.(\d+)\.\d+$")
+
+
+def parse_parent_link(did: str, extra: dict | None = None,
+                      parent_id: str | None = None) -> tuple[str, int | None, str]:
+    """推出设备归属的父设备 did、通道号与父设备类型。
+
+    以云端字段为准（改名也认得出）：
+    - 多键面板拆出的按键：extra.split.parentId + extra.split.moduleId
+      → 类型 "split"，父体自己没有那一路上，不可控
+    - 网关下的子机：顶层 parent_id → 类型 "proxy"，父体自身仍可控
+    云端没给时按 did 形态兜底，保证旧接口/旧缓存也能归类。
+
+    返回 ("", None, "") 表示这台设备不属于任何父设备。
+    """
+    split = {}
+    if isinstance(extra, dict):
+        maybe = extra.get("split")
+        if isinstance(maybe, dict):
+            split = maybe
+    pid = str(split.get("parentId") or "").strip()
+    if pid:
+        siid = split.get("moduleId")
+        try:
+            siid = int(siid) if siid is not None else None
+        except (TypeError, ValueError):
+            siid = None
+        return pid, siid, "split"
+    pid = str(parent_id or "").strip()
+    if pid:
+        return pid, None, "proxy"
+    match = _SUB_DEVICE_SUFFIX.search(did)
+    if match:
+        return did[:match.start()], int(match.group(1)), "split"
+    match = _PROXY_DID.match(did)
+    if match:
+        return match.group(1), None, "proxy"
+    return "", None, ""
 # spec 并发拉取线程数；目标是 miot-spec.org 的独立请求，无会话竞争
 _SPEC_WORKERS = 8
+# 产品页中文名的并发数：同一站点的独立页面请求，8 路实测稳定
+_NAME_WORKERS = 8
 
 
 class ServiceError(Exception):
@@ -74,14 +116,19 @@ class MijiaService:
         self._device_index: dict[str, tuple[str, str, str]] = {}
         # spec_type -> spec 内存缓存，轮询命中后不再读文件/打网络
         self._spec_cache: dict[str, dict | None] = {}
-        # spec 产品名缓存就绪后的产品页中文名缓存：
-        # model -> 中文名或 None（已确认无中文名，不再重查）
-        self._product_page_names: dict[str, str | None] = {}
+        # 产品页中文名缓存：model -> 中文名或 None（已确认无中文名，不再重查）。
+        # 启动即从磁盘加载：这份数据只有米家产品页一个来源，抓到就不会变，
+        # 落盘后第二次启动不用再等二十多个型号依次抓一遍
+        self._product_page_names: dict[str, str | None] = product_name_store.load()
         # model -> 图标 URL 或 None（拉取失败，会话内不再重试）；
         # 启动即从磁盘加载，此后只增不删（见 icon_store）
         self._icon_cache: dict[str, str | None] = icon_store.load_urls()
         # 家庭名 -> 家庭 ID 映射，场景列表按家庭过滤用；懒加载缓存
         self._home_ids: dict[str, str] | None = None
+        # 多键面板的父体 did 集合，由 list_devices 填充。这类设备自己
+        # 没有独立负载——规格里只有各通道的 on-2..on-N，按"第一条 on"
+        # 去控就会误控第一路；网关父体不在此列（它有属于自己的 on）
+        self._virtual_parents: set[str] = set()
 
     def _init_api(self) -> mijiaAPI:
         """构造上游客户端；认证文件损坏时隔离坏文件并降级为未登录。
@@ -163,9 +210,14 @@ class MijiaService:
                     location[str(did)] = (home["name"], room["name"])
 
         result = []
+        split_parents: set[str] = set()
         for d in devices:
             did = str(d["did"])
             home_name, room_name = location.get(did, ("未知", "未知"))
+            parent_did, parent_siid, parent_kind = parse_parent_link(
+                did, d.get("extra"), d.get("parent_id"))
+            if parent_kind == "split":
+                split_parents.add(parent_did)
             result.append(DeviceInfo(
                 did=did,
                 name=d.get("name", did),
@@ -175,7 +227,14 @@ class MijiaService:
                 online=bool(d.get("isOnline", False)),
                 # 云端对无公开规格的设备（手表、第三方牙刷等）不下发该字段
                 spec_type=d.get("spec_type") or "",
+                parent_did=parent_did,
+                parent_siid=parent_siid,
+                parent_kind=parent_kind,
             ))
+        # 只把"多键面板的父体"记为不可控：这类设备规格里只有各通道的
+        # on-2..on-N，按第一条 on 写下去就是控第一路。网关父体自己有 on，
+        # 照常可控，不能一起禁掉
+        self._virtual_parents = split_parents
         return sorted(result, key=lambda x: (x.home_name, x.room_name, x.name))
 
     # ---------- 设备控制 ----------
@@ -415,7 +474,13 @@ class MijiaService:
         首次点击要等两三次网络往返；直写批量接口一次请求完成。
         子设备的请求实际发往父 did（见 `_switch_target`），且不再试探
         子 did：那样每次都会白等约 6 秒才拿到拒绝。
+
+        多通道设备的父体在这里直接拒绝：它没有自己的那一路，按第一条
+        on 写下去就是去控第一路（见 power_states 里的同款判断）。
         """
+        if did in self._virtual_parents:
+            raise ServiceError(
+                "这是多通道设备的父设备，本身没有独立开关；请在详情页控制具体通道")
         info = self._specs_for([did]).get(did)
         method = self._find_on_method(info, did) if info else None
         if method is None:
@@ -461,6 +526,12 @@ class MijiaService:
         method_of: dict[str, dict] = {}
         target_of: dict[str, str] = {}
         for did in dids:
+            if did in self._virtual_parents:
+                # 父体本身没有独立负载：规格里只有 on-2..on-N（那是各按键
+                # 的），以前回退到第一条 on 会去控第一路，和「按键1」那张
+                # 卡片重复——用户点父设备的开关，关掉的却是第一路。
+                result[did] = None
+                continue
             info = spec_map.get(did)
             method = self._find_on_method(info, did) if info else None
             if method is None:
@@ -914,6 +985,21 @@ class MijiaService:
                 result[model] = name
         return result
 
+    def product_page_names(self, models: list[str]) -> dict[str, str | None]:
+        """并发抓取多个型号的产品页中文名，返回 model -> 名称或 None。
+
+        逐个抓时每个型号 2~3 秒，二十多个型号要等一分钟，排在后面的
+        （按型号名排序，空调网关在中间）用户基本等不到。并发抓一轮即可，
+        结果统一落盘（见 product_name_store），下次启动直接命中。
+        """
+        todo = [m for m in dict.fromkeys(models)
+                if m and m not in self._product_page_names]
+        if todo:
+            with ThreadPoolExecutor(max_workers=min(_NAME_WORKERS, len(todo))) as pool:
+                # product_page_name 内部已吞异常并按型号记忆结果
+                list(pool.map(self.product_page_name, todo))
+        return {m: self._product_page_names.get(m) for m in models}
+
     def product_page_name(self, model: str) -> str | None:
         """抓取 miot-spec 产品页（/p/<model>）的中文商品名。
 
@@ -945,6 +1031,8 @@ class MijiaService:
         except Exception as exc:
             logger.warning("产品页名称查询失败 %s: %s", model, exc)
         self._product_page_names[model] = name
+        # 落盘：成功与"确认无中文名"都记，避免下次启动重跑一遍
+        product_name_store.save(self._product_page_names)
         return name
 
     def spec_has_published_functions(self, spec_type: str) -> bool | None:

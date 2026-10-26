@@ -318,7 +318,8 @@ class SettingsDialog(OverlayDialog):
         ])
 
     def _build_features_page(self) -> QScrollArea:
-        """应用功能：开机自启动、默认指挥的音箱、系统托盘、托盘方式启动、隐藏无功能设备。"""
+        """应用功能：开机自启动、默认指挥的音箱、系统托盘、托盘方式启动、隐藏无功能设备、
+        多通道设备合并展示。"""
         # ── 开机自启动（写注册表 HKCU Run，默认关闭） ──
         self._autostart_item, self._autostart_label, self._autostart_desc, autostart_row = \
             self._make_item("开机自启动", "")
@@ -404,6 +405,16 @@ class SettingsDialog(OverlayDialog):
         _sync_switch(self._hide_toggle)
         hide_row.addWidget(self._hide_toggle)
 
+        # ── 多通道设备合并展示 ──
+        self._merge_item, self._merge_label, self._merge_desc, merge_row = self._make_item(
+            "多通道设备合并展示",
+            "开启后，多键面板与网关在设备页只显示一张卡片（标注通道数），"
+            "各按键的名称与开关在详情页里分别给出；关闭后每个通道仍是独立卡片")
+        self._merge_toggle = themed_switch()
+        self._merge_toggle.setChecked(settings_store.get_merge_multi_channel())
+        _sync_switch(self._merge_toggle)
+        merge_row.addWidget(self._merge_toggle)
+
         # ── 自动检测新版本 ──
         self._update_item, self._update_label, self._update_desc, update_row = self._make_item(
             "自动检测新版本",
@@ -417,7 +428,7 @@ class SettingsDialog(OverlayDialog):
         return self._build_scroll([
             self._autostart_item, self._speaker_item, self._tray_item,
             self._start_min_item, self._board_item, self._hide_item,
-            self._update_item,
+            self._merge_item, self._update_item,
         ])
 
     # ---------- 分类切换 ----------
@@ -473,7 +484,8 @@ class SettingsDialog(OverlayDialog):
         for item in (self._tray_item, self._start_min_item, self._fab_item,
                      self._scene_item, self._theme_item, self._autostart_item,
                      self._speaker_item, self._hide_item, self._scale_item,
-                     self._update_item, self._board_item, self._accent_item):
+                     self._update_item, self._board_item, self._accent_item,
+                     self._merge_item):
             item.setStyleSheet(panel_card)
             # 高度按内容自适应（不固定）：长描述换行后行自然变高，
             # 不会被固定 64px 裁掉；短描述保持紧凑。QScrollArea 负责
@@ -484,13 +496,15 @@ class SettingsDialog(OverlayDialog):
         for label in (self._tray_label, self._start_min_label, self._fab_label,
                       self._scene_label, self._theme_label, self._autostart_label,
                       self._speaker_label, self._hide_label, self._scale_label,
-                      self._update_label, self._board_label, self._accent_label):
+                      self._update_label, self._board_label, self._accent_label,
+                      self._merge_label):
             label.setStyleSheet(
                 f"color: {SiColors.TEXT_PRIMARY}; background: transparent; font-size: 10pt;")
         for desc in (self._tray_desc, self._start_min_desc, self._fab_desc,
                      self._scene_desc, self._theme_desc, self._autostart_desc,
                      self._speaker_desc, self._hide_desc, self._scale_desc,
-                     self._update_desc, self._board_desc, self._accent_desc):
+                     self._update_desc, self._board_desc, self._accent_desc,
+                     self._merge_desc):
             desc.setStyleSheet(
                 f"color: {SiColors.TEXT_SECONDARY}; background: transparent; font-size: 7pt;")
         # 主按钮文字固定白色（不随深/浅主题翻转）
@@ -669,6 +683,7 @@ class SettingsDialog(OverlayDialog):
         if self._devices:
             settings_store.set_voice_fab_enabled(self._voice_fab_toggle.isChecked())
         settings_store.set_hide_no_func_devices(self._hide_toggle.isChecked())
+        settings_store.set_merge_multi_channel(self._merge_toggle.isChecked())
         board_store.set_enabled(self._board_toggle.isChecked())
         settings_store.set_show_scene_tab(self._scene_toggle.isChecked())
         settings_store.set_check_update_enabled(self._update_toggle.isChecked())

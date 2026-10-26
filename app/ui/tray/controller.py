@@ -195,11 +195,19 @@ class TrayController:
         # 仅打开设备详情，不呼出主窗口，避免主窗口隐藏时卡死
         self._quick.hide()
         # 直接创建详情对话框，parent 设为 None 使其独立于主窗口显隐
-        dev = next((d for d in self._main.devices() if d.did == did), None)
+        devices = self._main.devices()
+        dev = next((d for d in devices if d.did == did), None)
         if dev is None:
             return
+        # 合并展示开启时把子通道一并交给详情页（与主界面同款行为）
+        from app.core.settings_store import get_merge_multi_channel
+        channels: list[DeviceInfo] = []
+        if get_merge_multi_channel():
+            channels = sorted(
+                (d for d in devices if d.parent_did == did),
+                key=lambda d: (d.parent_siid or 0, d.name))
         from app.ui.device_dialog import DeviceDetailDialog
-        dlg = DeviceDetailDialog(self._service, self._jobs, dev, None)
+        dlg = DeviceDetailDialog(self._service, self._jobs, dev, None, channels=channels)
         dlg.load()
         dlg.exec()
         dlg.deleteLater()

@@ -25,6 +25,9 @@ _DEFAULTS: dict = {
     # 由 ui/si_theme.set_accent 统一计算，这里只存用户选的那个值。
     "theme_accent": "",
     "hide_no_func_devices": False,
+    # 多通道设备合并展示（默认开）：多键面板/网关只出一张父卡片，
+    # 各通道收进详情页。关掉则回到"每个通道一张卡"的老样子。
+    "merge_multi_channel": True,
     "show_scene_tab": True,  # 主页选项卡最左侧显示「场景」入口（手动场景一键执行）
     "default_speaker_did": "",  # 小爱指令默认输出音箱；空串=自动（第一个在线）
     # 托盘音响栏正在控制哪台音箱。与 default_speaker_did 刻意分开：
@@ -134,6 +137,22 @@ def get_show_scene_tab() -> bool:
 def set_show_scene_tab(value: bool) -> None:
     raw = _read_raw()
     raw["show_scene_tab"] = bool(value)
+    _write_raw(raw)
+
+
+def get_merge_multi_channel() -> bool:
+    """多通道设备是否合并展示，默认开启。
+
+    开启：多键面板/网关在设备页只出一张父卡，各通道在详情页里分别开关。
+    关闭：每个通道依旧是独立卡片（老样子），但父卡同样不挂电源钮——
+    它本来就没有属于自己的那一路。
+    """
+    return bool(_read_raw().get("merge_multi_channel", True))
+
+
+def set_merge_multi_channel(value: bool) -> None:
+    raw = _read_raw()
+    raw["merge_multi_channel"] = bool(value)
     _write_raw(raw)
 
 

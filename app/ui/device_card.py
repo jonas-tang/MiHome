@@ -43,12 +43,21 @@ class DeviceCard(SiRowCard):
     power_clicked = Signal(str)  # did
     open_requested = Signal(str)  # did
 
-    def __init__(self, device: DeviceInfo, parent=None):
+    def __init__(self, device: DeviceInfo, parent=None, show_room: bool = True,
+                 channel_count: int = 0, power_enabled: bool = True):
         super().__init__(parent, self.LeftToRight)
         self.device = device
         self._busy = False
         self._hovered = False
         self._online = device.online
+        # 「全屋」视图按房间分段后，段内每张卡都重复房间名只是噪音，
+        # 由调用方传 False 关掉；读数与离线标记仍然照常显示
+        self._show_room = show_room
+        # 多通道设备合并展示时，父卡代表整台设备：副标题标出通道数
+        self._channels = channel_count
+        # 父设备本身没有独立的那一路（其规格只有各通道的 on-2..on-N），
+        # 给它挂电源钮必然控到第一路，与「按键1」卡片重复——直接不给
+        self._power_enabled = power_enabled
 
         self.style_data.background_color = QColor(
             SiColors.OFFLINE_CARD if not self._online else SiColors.CARD)
@@ -123,18 +132,28 @@ class DeviceCard(SiRowCard):
         self._icon_label.show()
 
     def set_power_state(self, state: bool) -> None:
+        # 父设备没有自己的那一路：状态回来也不显示按钮
+        if not self._power_enabled:
+            return
         # 能设置状态即证明设备具备开关能力，电源钮随之可见
         self._power_btn.set_state(state)
         self._power_btn.show()
 
     def _sub_text(self, metrics: str | None = None) -> str:
-        """副标题文案：离线优先显示离线标记，有读数时附带。"""
-        base = self.device.room_name
+        """副标题文案：房间名 / 通道数 / 离线标记 / 实时读数，取有的拼。
+
+        `_show_room` 为假时不重复房间名（分组视图的段标题已经写了）。
+        """
+        parts: list[str] = []
+        if self._show_room and self.device.room_name:
+            parts.append(self.device.room_name)
+        if self._channels >= 2:
+            parts.append(f"{self._channels} 个通道")
         if not self._online:
-            return f"{base} · 离线"
-        if metrics:
-            return f"{base} | {metrics}"
-        return base
+            parts.append("离线")
+        elif metrics:
+            parts.append(metrics)
+        return " · ".join(parts)
 
     def set_metrics(self, text: str | None) -> None:
         """副标题附带实时读数（温湿度等），离线卡片不叠加读数。"""

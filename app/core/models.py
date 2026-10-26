@@ -25,6 +25,24 @@ class DeviceInfo:
     room_name: str
     online: bool
     spec_type: str = ""
+    # 虚拟子设备归属：多键面板拆出的按键、网关下的子机。
+    # 云端经 extra.split.parentId(+moduleId) 或顶层 parent_id 给出，
+    # 是唯一可靠的父子依据——设备被改过名也照样对得上（实测 77/77 命中）。
+    # 空串表示这台设备自己就是独立的物理设备（或父体本身）。
+    parent_did: str = ""
+    # 子设备占用的通道（即规格里的 siid），面板按键为 2、3、4…；
+    # 云端没给（网关子机）时为 None
+    parent_siid: int | None = None
+    # 父设备的类型，决定父卡还能不能有开关：
+    # - "split"：多键面板拆出来的按键，父体没有属于自己的那一路，
+    #   按"第一条 on"去控必然控错（会关掉第一路），所以父体不可控
+    # - "proxy"：网关下的子机，网关自身还有独立的 on，照常可控
+    parent_kind: str = ""
+
+    @property
+    def is_sub_device(self) -> bool:
+        """是否为某个物理设备拆出来的子设备/通道。"""
+        return bool(self.parent_did)
 
 
 @dataclass

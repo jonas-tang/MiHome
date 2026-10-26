@@ -63,6 +63,9 @@ _ALL_ROOMS = "全屋"
 _ALL_HOMES = "全部"
 # 场景选项卡：位于「全屋」左侧的特殊房间值，选中后网格切换为场景视图
 _SCENE_TAB = "场景"
+# 米家里没分到房间的设备：房间 tab 里不出现（点它没有意义），
+# 但「全屋」分组视图必须有个落点，否则这些设备会凭空消失
+_UNASSIGNED_ROOM = "未分配房间"
 
 # 外部（APP/语音/物理按键）改状态后卡片靠轮询跟随。
 # 3 秒：一次整批读约 0.3~0.8 秒（批次已提到 20 台/次），加上间隔后
@@ -220,6 +223,14 @@ class MainWindow(QMainWindow):
         # 隐藏无可控制功能的设备（设置开关，默认关）
         from app.core.settings_store import get_hide_no_func_devices
         self._hide_no_func = get_hide_no_func_devices()
+        # 多通道设备合并展示（设置开关，默认开）：开启后父设备只出一张卡，
+        # 各通道收进详情页
+        from app.core.settings_store import get_merge_multi_channel
+        self._merge_channels = get_merge_multi_channel()
+        # 父设备 did -> 它的子设备（含通道号排序），随设备列表重建
+        self._children: dict[str, list[DeviceInfo]] = {}
+        # 面板拆键的父体 did：它们没有自己的那一路，不轮询、不给电源钮
+        self._split_parents: set[str] = set()
         # 场景选项卡（设置开关，默认开）与场景视图状态：
         # _scenes 为 None 表示尚未加载，空列表为「确认无场景」
         from app.core.settings_store import get_show_scene_tab
@@ -938,6 +949,19 @@ class MainWindow(QMainWindow):
 
     def _apply_devices(self, devices: list[DeviceInfo]) -> None:
         self._all_devices = devices
+        # 先建父子索引：合并展示、父卡标注、详情页通道都依赖它
+        children: dict[str, list[DeviceInfo]] = {}
+        for device in devices:
+            if device.parent_did:
+                children.setdefault(device.parent_did, []).append(device)
+        for group in children.values():
+            group.sort(key=lambda d: (d.parent_siid or 0, d.name))
+        self._children = children
+        # 面板拆键的父体（自身没有独立那一路）不参与开关轮询：
+        # 读回来的是第一路的状态，会把父卡和「按键1」算成两台
+        self._split_parents = {
+            parent for parent, group in children.items()
+            if any(c.parent_kind == "split" for c in group)}
         homes = sorted(
             {d.home_name for d in devices},
             key=lambda h: (h == "未知", h),
@@ -1040,7 +1064,9 @@ class MainWindow(QMainWindow):
             self._localize_busy = True
             self._localize_attempted.update(pending)
             self._web_jobs.submit(
-                lambda: [self._service.product_page_name(m) for m in pending],
+                # 并发批量取：逐个抓时二十多个型号要等一分钟，排在后面的
+                # （如空调网关）用户根本等不到，看到的永远是英文名
+                lambda: self._service.product_page_names(pending),
                 on_success=lambda _: self._on_product_names_fetched(),
                 on_error=lambda e: self._on_product_names_failed(e),
                 priority=PRIORITY_IDLE,
@@ -1066,6 +1092,9 @@ class MainWindow(QMainWindow):
         self._rebuild_grid()
         self._update_count_label()
         self._update_tray_devices()
+        # 落盘：中文名只在本次进程里生效的话，下次启动又要等一轮抓取，
+        # 而设备列表缓存本来就会带着显示名走，直接一并存下来
+        device_cache.save(self._all_devices, self._known_power, self._metrics)
         return True
 
     def _on_product_names_fetched(self) -> None:
@@ -1333,6 +1362,14 @@ class MainWindow(QMainWindow):
             self._rebuild_tabs()
             self._rebuild_grid()
             self._update_count_label()
+        # “多通道设备合并展示”开关可能变化：卡片集合与父卡标注都要重建
+        from app.core.settings_store import get_merge_multi_channel
+        new_merge = get_merge_multi_channel()
+        if new_merge != self._merge_channels:
+            self._merge_channels = new_merge
+            self._rebuild_grid()
+            self._update_count_label()
+            self._refresh_power_states(force=False)
         # 同步小爱悬浮按钮显隐
         self._update_voice_fab()
 
@@ -1549,7 +1586,8 @@ class MainWindow(QMainWindow):
         就被排除在轮询之外——不是停止探测，而是"再也不刷新"：在米家 App
         里改了开关，挂件上一直显示切换房间那一刻的旧状态。
         """
-        dids = [d.did for d in self._visible_devices() if d.online]
+        dids = [d.did for d in self._visible_devices()
+                if d.online and d.did not in self._split_parents]
         if self._board is None:
             return dids
         extra = set(self._board.tracked_dids()) - set(dids)
@@ -1724,6 +1762,8 @@ class MainWindow(QMainWindow):
             if (self._current_home == _ALL_HOMES or d.home_name == self._current_home)
             and (self._current_room == _ALL_ROOMS or d.room_name == self._current_room)
             and (not self._hide_no_func or self._device_has_functions(d))
+            # 合并展示时子通道不再单独成卡：它们归属父设备那张卡
+            and not (self._merge_channels and d.parent_did)
         ]
 
     def _device_has_functions(self, device: DeviceInfo) -> bool:
@@ -1874,25 +1914,131 @@ class MainWindow(QMainWindow):
         )
         cols = self._columns_for_width(self._scroll.viewport().width())
         self._grid_columns = cols
-        rows = (len(visible) + cols - 1) // cols
-        for index, device in enumerate(visible):
-            card = DeviceCard(device)
-            # 记忆里的开关状态与读数立即回显，重建卡片不丢状态
-            known = self._known_power.get(device.did)
-            if known is not None:
-                card.set_power_state(known)
-            if device.did in self._metrics:
-                card.set_metrics(self._metrics.get(device.did))
-            # 已下载的图标从本地文件回填：主题/tab 切换重建卡片后
-            # 图标不消失；未下载的由 _load_card_icons 后台补齐
-            path = icon_store.icon_path(device.model)
-            if path.is_file():
-                card.set_icon(path)
-            card.power_clicked.connect(self._on_power_clicked)
-            card.open_requested.connect(self._on_open_device)
-            self._cards[device.did] = card
-            self._grid.addWidget(card, index // cols, index % cols)
+        # 「全屋」是默认视图，设备一多就是一片无差别的卡片墙，找一台
+        # 客厅的灯得靠肉眼扫。分组只在这一视图生效；已经点进具体房间
+        # 时范围本就收窄，再加一层标题纯属重复（多家庭同名房间也一样）。
+        # 只有一组时不加标题：账号里一台设备都没分房间时，"未分配房间"
+        # 这一行标题没有提供任何信息。
+        groups = self._room_groups(visible)
+        if self._current_room == _ALL_ROOMS and len(groups) > 1:
+            rows = self._fill_grouped_grid(groups, cols)
+        else:
+            rows = self._fill_flat_grid(visible, cols)
         self._finalize_grid(cols, rows)
+
+    # ---------- 设备卡片布局 ----------
+
+    def _room_groups(self, devices: list[DeviceInfo]
+                     ) -> list[tuple[str, list[DeviceInfo]]]:
+        """按（家庭, 房间）分桶，返回 [(标题, 设备列表)]。
+
+        房间名在同一家庭内唯一，但「全部」家庭视线下两个家庭都可能有
+        「客厅」，只按房间名合并会把两套房子的设备混成一堆，所以分桶
+        键带家庭；标题也只在多家庭同时出现时才加家庭名前缀。
+        """
+        buckets: dict[tuple[str, str], list[DeviceInfo]] = {}
+        for device in devices:
+            room = device.room_name
+            if not room or room == "未知":
+                room = ""
+            buckets.setdefault((device.home_name, room), []).append(device)
+
+        # 家庭顺序沿用家庭菜单（_homes），房间按名字排；未分配房间垫底
+        home_order = {name: index for index, name in enumerate(self._homes)}
+        multi_home = len({home for home, _ in buckets}) > 1
+
+        def sort_key(item):
+            (home, room), _items = item
+            return (1 if not room else 0,
+                    home_order.get(home, len(home_order)),
+                    room)
+
+        groups = []
+        for (home, room), items in sorted(buckets.items(), key=sort_key):
+            if not room:
+                title = _UNASSIGNED_ROOM
+            elif multi_home:
+                title = f"{home} · {room}"
+            else:
+                title = room
+            groups.append((title, items))
+        return groups
+
+    def _fill_flat_grid(self, devices: list[DeviceInfo], cols: int) -> int:
+        """单房间视图：直接平铺，没有分组标题。"""
+        for index, device in enumerate(devices):
+            self._add_device_card(device, index // cols, index % cols)
+        return (len(devices) + cols - 1) // cols
+
+    def _fill_grouped_grid(self, groups: list[tuple[str, list[DeviceInfo]]],
+                           cols: int) -> int:
+        """「全屋」视图：一个房间一段，段标题横跨整行。"""
+        row = 0
+        for title, devices in groups:
+            header = self._make_room_header(title, len(devices))
+            self._grid.addWidget(header, row, 0, 1, cols)
+            row += 1
+            for index, device in enumerate(devices):
+                # 段标题已写明房间，卡片不再重复
+                self._add_device_card(
+                    device, row + index // cols, index % cols, show_room=False)
+            row += (len(devices) + cols - 1) // cols
+        return row
+
+    def _make_room_header(self, title: str, count: int) -> QWidget:
+        """分段标题：房间名 + 台数 + 一条延伸到右侧的细线。"""
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        lay = QHBoxLayout(holder)
+        # 上边距承担段间距：网格 spacing 对跨列条目不生效，只能自己留白
+        lay.setContentsMargins(4, 18, 12, 2)
+        lay.setSpacing(8)
+
+        name = QLabel(title)
+        name.setFont(QFont("Microsoft YaHei UI", 11, QFont.Weight.DemiBold))
+        name.setStyleSheet(
+            f"color: {SiColors.TEXT_PRIMARY}; background: transparent;")
+        count_label = QLabel(f"{count} 台")
+        count_label.setStyleSheet(
+            f"color: {SiColors.TEXT_MUTED}; background: transparent;"
+            " font-size: 9pt;")
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        line.setStyleSheet(f"background: {SiColors.LINE}; border: none;")
+
+        lay.addWidget(name, 0, Qt.AlignmentFlag.AlignBottom)
+        lay.addWidget(count_label, 0, Qt.AlignmentFlag.AlignBottom)
+        lay.addSpacing(2)
+        lay.addWidget(line, 1, Qt.AlignmentFlag.AlignVCenter)
+        return holder
+
+    def _add_device_card(self, device: DeviceInfo, row: int, col: int,
+                         show_room: bool = True) -> None:
+        children = self._children.get(device.did, [])
+        # 只有"多键面板拆键"的父体不可控；网关父体自己有 on，照旧给按钮
+        split_parent = any(c.parent_kind == "split" for c in children)
+        card = DeviceCard(
+            device, show_room=show_room,
+            # 合并展示时父卡标出通道数（"主卧 · 4 个通道"）
+            channel_count=len(children) if self._merge_channels else 0,
+            power_enabled=not split_parent,
+        )
+        # 记忆里的开关状态与读数立即回显，重建卡片不丢状态
+        known = self._known_power.get(device.did)
+        if known is not None:
+            card.set_power_state(known)
+        if device.did in self._metrics:
+            card.set_metrics(self._metrics.get(device.did))
+        # 已下载的图标从本地文件回填：主题/tab 切换重建卡片后
+        # 图标不消失；未下载的由 _load_card_icons 后台补齐
+        path = icon_store.icon_path(device.model)
+        if path.is_file():
+            card.set_icon(path)
+        card.power_clicked.connect(self._on_power_clicked)
+        card.open_requested.connect(self._on_open_device)
+        self._cards[device.did] = card
+        self._grid.addWidget(card, row, col)
 
     def _rebuild_scene_grid(self) -> None:
         """场景视图网格：卡片尺寸与设备卡一致，列数换算直接复用。"""
@@ -2168,7 +2314,11 @@ class MainWindow(QMainWindow):
         device = next((d for d in self._all_devices if d.did == did), None)
         if device is None:
             return
-        dialog = DeviceDetailDialog(self._service, self._jobs, device, self)
+        dialog = DeviceDetailDialog(
+            self._service, self._jobs, device, self,
+            # 合并展示时把子通道交给详情页：父设备自己不控任何一路，
+            # 完整的控制入口在抽屉里的通道列表
+            channels=self._children.get(did, []) if self._merge_channels else [])
         # 详情内取到温湿度后直接回写卡片与缓存（手动刷新的即时反馈）
         dialog.panel.metrics_updated.connect(self._on_detail_metrics)
         dialog.load()
