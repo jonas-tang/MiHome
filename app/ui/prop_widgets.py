@@ -355,6 +355,27 @@ class SliderSection(QFrame):
             self._slider.blockSignals(False)
         self._update_value_text(value)
 
+    def set_compact(self, compact: bool = True) -> None:
+        """紧凑版：滑轨按固定高度排，不再把整张卡片顶到半屏。
+
+        siui 滑块的 sizeHint 高度是 480（它是按"占满父容器"设计的），
+        单独放进工作台那种大卡片里没问题，但参数列表一屏要放七八项时，
+        一张亮度卡就吃掉半屏——留白问题就出在这。
+        """
+        if not compact:
+            return
+        self._slider.setFixedHeight(28)
+        self._slider.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        lay = self.layout()
+        if lay is not None:
+            lay.setContentsMargins(14, 10, 14, 10)
+            lay.setSpacing(8)
+        # 高度交给 sizeHint，不再随容器伸缩
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
 
 class EnumGridSection(QFrame):
     """模式卡片：标题 + 圆形按钮网格，点击即写入对应枚举值。"""

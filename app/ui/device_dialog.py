@@ -18,7 +18,7 @@
 
 import logging
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QFrame,
@@ -49,6 +49,31 @@ _CHANNELS_PER_ROW = 4
 def _cn(desc: str) -> str:
     """'Switch Status / 一键' -> '一键'：界面只留中文那一段。"""
     return desc.split("/")[-1].strip()
+
+
+def _compact(widget: QWidget) -> None:
+    """把功能卡片压紧一些，参数列表用。
+
+    这些卡片本来是为工作台那种"一屏几块大卡"的版面设计的：内边距
+    16~24、固定高度 76/104。参数列表里一屏要放七八项，同样的留白会
+    让列表显得又长又散，滑块那类（标题 + 滑轨）尤其明显。
+    """
+    widget.setMinimumHeight(0)
+    widget.setMaximumHeight(16777215)  # 清掉 setFixedHeight 留下的上限
+    lay = widget.layout()
+    if lay is not None:
+        m = lay.contentsMargins()
+        lay.setContentsMargins(min(m.left(), 14), min(m.top(), 8),
+                               min(m.right(), 14), min(m.bottom(), 8))
+        if lay.spacing() > 6:
+            lay.setSpacing(6)
+    # 滑轨这类控件自带"占满容器"的尺寸提示（siui 滑块 480px），
+    # 交给它自己的紧凑版处理；其余卡片按 sizeHint 定高，不再伸缩
+    if hasattr(widget, "set_compact"):
+        widget.set_compact(True)
+    else:
+        widget.setSizePolicy(QSizePolicy.Policy.Preferred,
+                             QSizePolicy.Policy.Fixed)
 
 
 class _PropPanel(QFrame):
@@ -102,7 +127,8 @@ class _PropPanel(QFrame):
         host.setStyleSheet("background: transparent;")
         self._body = QVBoxLayout(host)
         self._body.setContentsMargins(0, 0, 0, 0)
-        self._body.setSpacing(10)
+        # 行距压到 6px：参数列表一屏要放得下更多项
+        self._body.setSpacing(6)
         self._scroll.setWidget(host)
         lay.addWidget(self._scroll, stretch=1)
 
@@ -159,10 +185,20 @@ class _PropPanel(QFrame):
                 range=prop.range, value_list=prop.value_list)
             section = build_prop_section(
                 display, lambda value, p=prop: self._write_prop(p, value))
+            _compact(section)
             self._sections[prop.name] = section
             self._body.addWidget(section)
         self._body.addStretch(1)
+        # 排完再按各自需要的高度钉住：容器不够高时让外层滚动，
+        # 而不是把每张卡片压扁（枚举网格被压扁会丢掉后面的选项）
+        QTimer.singleShot(0, self._freeze_heights)
         self.reload()
+
+    def _freeze_heights(self) -> None:
+        for section in self._sections.values():
+            height = section.sizeHint().height()
+            if height > section.minimumHeight():
+                section.setMinimumHeight(height)
 
     # ---------- 读写 ----------
 
