@@ -15,8 +15,8 @@ from pathlib import Path
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPixmap
+from PySide6.QtCore import QEvent, QRect, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
     QLabel,
     QSizePolicy,
@@ -58,6 +58,8 @@ class DeviceCard(SiRowCard):
         # 父设备本身没有独立的那一路（其规格只有各通道的 on-2..on-N），
         # 给它挂电源钮必然控到第一路，与「按键1」卡片重复——直接不给
         self._power_enabled = power_enabled
+        # 设备名按实际宽度缩过字号没有（只在首次显示时算一次）
+        self._name_fitted = False
 
         self.style_data.background_color = QColor(
             SiColors.OFFLINE_CARD if not self._online else SiColors.CARD)
@@ -76,12 +78,18 @@ class DeviceCard(SiRowCard):
         self._power_btn.set_online(self._online)
 
         name_color = SiColors.TEXT_PRIMARY if self._online else SiColors.OFFLINE_TEXT
+        self._name_color = name_color
         self._name_label = QLabel(device.name)
-        self._name_label.setFont(QFont("Microsoft YaHei UI", 15, QFont.Weight.DemiBold))
+        # 全局 QSS 的 `* { font-size: 10pt }` 优先级高于 QWidget.setFont()，
+        # 名称一直就是 10pt（setFont(15) 从来没生效过）。字号统一走样式表，
+        # 这里保持与正文一致的 10pt，只把"过长就溢出卡片"的问题修掉
+        self._name_label.setStyleSheet(
+            f"color: {name_color}; background: transparent;"
+            " font-size: 10pt; font-weight: 600;")
         # 允许换行：长名称不再把所在列撑宽，卡片宽度保持整齐
         self._name_label.setWordWrap(True)
-        self._name_label.setStyleSheet(
-            f"color: {name_color}; background: transparent;")
+        self._name_label.setToolTip(device.name)
+        self._name_label.installEventFilter(self)
 
         self._sub_label = QLabel(self._sub_text())
         self._sub_label.setFont(QFont("Microsoft YaHei UI", 11))
@@ -116,6 +124,56 @@ class DeviceCard(SiRowCard):
         lay.addWidget(text_col)
         lay.addStretch(1)
         lay.addWidget(self._power_btn, alignment=Qt.AlignVCenter)
+
+    # ---------- 名称排版 ----------
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt 命名约定)
+        super().showEvent(event)
+        # 卡片是固定尺寸，长名字（"Yeelight Tube Plus2屏幕挂灯"）用 15pt
+        # 换行后能撑出三四行、直接盖到卡片外面。宽度此刻已知，按两行上限
+        # 逐级降字号，比截断保留更多信息
+        if not self._name_fitted:
+            self._name_fitted = True
+            self._fit_name_font()
+
+    def _fit_name_font(self) -> None:
+        """名称最多两行，放不下就把尾部截掉加省略号。
+
+        卡片是固定尺寸（200×92），设备名却可能很长
+        （"Yeelight Tube Plus2屏幕挂灯"）。以前直接换行会撑到三四行、
+        盖到卡片外面；这里按当前宽度算两行能放下多少字，插件的宽度变化
+        （电源钮探测出来后才显示）也跟着重算。
+        """
+        width = self._name_label.width()
+        if width <= 0:
+            return
+        metrics = QFontMetrics(QFont("Microsoft YaHei UI", 10, QFont.Weight.DemiBold))
+        # 两行的高度上限，留 2px 余量：boundingRect 的 2 行结果比
+        # 2×lineSpacing 略高，卡死等于只允许一行（实测全被截成单行）
+        max_height = 2 * metrics.lineSpacing() + 2
+        text = self.device.name
+        rect = metrics.boundingRect(
+            QRect(0, 0, width, 10000), Qt.TextFlag.TextWordWrap, text)
+        if rect.height() > max_height:
+            # 二分找"两行内放得下的最长前缀"，再补省略号
+            low, high = 0, len(text)
+            while low < high:
+                mid = (low + high + 1) // 2
+                probe = metrics.boundingRect(
+                    QRect(0, 0, width, 10000), Qt.TextFlag.TextWordWrap, text[:mid] + "…")
+                if probe.height() <= max_height:
+                    low = mid
+                else:
+                    high = mid - 1
+            text = text[:low].rstrip() + "…"
+        if self._name_label.text() != text:
+            self._name_label.setText(text)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt 命名约定)
+        # 名称区域宽度变化（电源钮出现/窗口换列）时重挑字号
+        if obj is self._name_label and event.type() == QEvent.Type.Resize:
+            self._fit_name_font()
+        return super().eventFilter(obj, event)
 
     # ---------- 状态渲染 ----------
 

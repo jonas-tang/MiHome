@@ -91,6 +91,8 @@ class _PropPanel(QFrame):
         self._did: str | None = None
         self._sections: dict[str, QWidget] = {}
         self._read_busy = False
+        # 内容重建后要不要把滚动条拉回顶部（延到排版完成后再执行）
+        self._reset_scroll_pending = False
         # 取值代次：连续切换通道时，上一次的读请求回来不能把这一批
         # 的"忙碌"标志清掉、也不能往新的一组控件里填旧值
         self._gen = 0
@@ -189,16 +191,38 @@ class _PropPanel(QFrame):
             self._sections[prop.name] = section
             self._body.addWidget(section)
         self._body.addStretch(1)
-        # 排完再按各自需要的高度钉住：容器不够高时让外层滚动，
+        # 回到顶部：重建内容后滚动条可能停在旧位置（或者被自动聚焦的控件
+        # 带着滚走），第一张卡片会被顶出视野
+        self._reset_scroll_pending = True
+        # 排完再按"当前宽度下真正需要的高度"钉住：容器不够高时让外层滚动，
         # 而不是把每张卡片压扁（枚举网格被压扁会丢掉后面的选项）
-        QTimer.singleShot(0, self._freeze_heights)
+        QTimer.singleShot(0, self._sync_heights)
         self.reload()
 
-    def _freeze_heights(self) -> None:
+    def _sync_heights(self) -> None:
+        """按实际宽度重算每张卡片需要的高度。
+
+        枚举网格用的是流式布局，选项会自动换行：宽度不同，需要的高度
+        可能从 1 行（70px）变成 3 行（220px）。只按 sizeHint 定高会把
+        宽度尚未确定时的"窄屏结果"冻住——窗帘的「电机控制」就是这么被
+        撑到 228px 的（实际在 866px 宽下只要 72px）。
+        """
         for section in self._sections.values():
-            height = section.sizeHint().height()
-            if height > section.minimumHeight():
+            width = section.width()
+            if section.hasHeightForWidth() and width > 0:
+                height = section.heightForWidth(width)
+            else:
+                height = section.sizeHint().height()
+            if height > 0 and abs(height - section.minimumHeight()) > 2:
                 section.setMinimumHeight(height)
+        if getattr(self, "_reset_scroll_pending", False):
+            self._reset_scroll_pending = False
+            self._scroll.verticalScrollBar().setValue(0)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # 宽度变化（抽屉缩放/滚动条出现）后流式布局的换行数会变
+        QTimer.singleShot(0, self._sync_heights)
 
     # ---------- 读写 ----------
 

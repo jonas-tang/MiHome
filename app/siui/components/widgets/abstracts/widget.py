@@ -1,5 +1,3 @@
-import os
-
 from PySide6.QtCore import QPoint, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import QWidget
@@ -326,7 +324,10 @@ class SiWidget(QWidget):
             return
 
         progress = self.animationGroup().fromToken("showing").current()
-        qt_scale_factor = float(os.environ["QT_SCALE_FACTOR"])
+        # 用控件自身的设备像素比渲染快照：它已经把"系统 DPI × 应用缩放"
+        # 都算进去了，换到不同缩放的显示器上也对；早先读 QT_SCALE_FACTOR
+        # 环境变量，既拿不到系统 DPI 那一层，变量没设时还会直接 KeyError
+        qt_scale_factor = self.devicePixelRatioF() or 1.0
 
         scale_factor, opacity_factor = self.factor_func(progress)
 

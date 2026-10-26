@@ -268,11 +268,11 @@ class SettingsDialog(OverlayDialog):
         accent_row.addLayout(accent_box)
         self._refresh_accent_ui()
 
-        # ── 界面缩放比例（高 DPI 屏幕微调；更改后重启生效） ──
+        # ── 界面缩放比例（默认 100% = 完全跟随系统缩放；更改后重启生效） ──
         self._scale_item, self._scale_label, self._scale_desc, scale_row = self._make_item(
             "界面缩放比例",
-            "调整界面整体元素大小（在系统缩放之上叠加），适用于高 DPI 屏幕使用"
-            "较高系统缩放时觉得界面偏大的情况；可从下拉选档位或直接键入任意"
+            "界面默认完全跟随 Windows 的缩放设置（100% 即不额外放大）；"
+            "觉得偏大或偏小时可在这里整体调整，可从下拉选档位或直接键入任意"
             "百分比，更改后需重启应用生效")
         self._original_ui_scale = settings_store.get_ui_scale()
         self._pending_ui_scale = self._original_ui_scale
