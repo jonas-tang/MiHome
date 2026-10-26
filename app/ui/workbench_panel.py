@@ -77,6 +77,9 @@ class _SpinCircle(QWidget):
 
 class WorkbenchPanel(QWidget):
     metrics_updated = Signal(str, str)
+    # 设备详情与工作台内容就绪：详情页要在工作台下方补一块"其余可配置参数"，
+    # 需要知道哪些功能已经放在工作台上（避免同一项出现两次）
+    detail_loaded = Signal(object)
 
     def __init__(self, service: MijiaService, jobs, parent=None):
         super().__init__(parent)
@@ -85,6 +88,8 @@ class WorkbenchPanel(QWidget):
         self._current_did: str | None = None
         self._current_online: bool = True
         self._detail: DeviceDetail | None = None
+        # 调用方给的显示名（本地化后），比详情接口返回的云端原名更贴近卡片
+        self._preferred_name: str = ""
         self._sections: dict[str, QWidget] = {}
         self._module_defs: list[tuple[str, str, str]] = []
         self._module_builders: dict[str, Callable[[], QWidget]] = {}
@@ -246,12 +251,25 @@ class WorkbenchPanel(QWidget):
 
     # ---------- 加载 ----------
 
+    def set_body_visible(self, visible: bool) -> None:
+        """收起/展开工作台主体，只留标题行。
+
+        工作台还空着时（用户没往里加过功能），详情页下方已经会列出这个
+        设备的全部参数，再让"面板还是空的"占掉半屏只是浪费空间。
+        """
+        self._body.setVisible(visible)
+        if not visible:
+            self._empty.hide()
+
     def show_device(self, did: str, online: bool = True, device: DeviceInfo | None = None) -> None:
         self._current_did = did
         self._current_online = online
         self._detail = None
         self._clear_workbench()
         name = device.name if device else "设备"
+        # 卡片上的名字是本地化后的（如"米家净水器S1 1600G"），设备详情接口
+        # 只会给云端原名（英文）；这里记住调用方给的名字，加载完优先用它
+        self._preferred_name = device.name if device else ""
         room = device.room_name if device else ""
         self._title_label.setText(name)
         self._model_label.setText(room)
@@ -275,7 +293,8 @@ class WorkbenchPanel(QWidget):
             return
         self._loading.hide()
         self._detail = detail
-        self._title_label.setText(detail.name)
+        # 优先用调用方给的本地化名称，避免详情页又退回云端英文名
+        self._title_label.setText(self._preferred_name or detail.name)
         self._model_label.setText(detail.model)
         self._title_label.show()
         self._model_label.show()
@@ -296,6 +315,7 @@ class WorkbenchPanel(QWidget):
         self._render_workbench()
         self._refresh_btn.show()
         self._edit_btn.show()
+        self.detail_loaded.emit(detail)
 
     def _default_keys(self) -> list[str]:
         # 优先选择独立的 on 开关（最常用的控制方式）

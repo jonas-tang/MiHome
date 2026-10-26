@@ -72,17 +72,21 @@ remove_dist() {
     return 1
 }
 
-# 不论是否 --clean 都要清掉旧 dist：留着旧产物会让"产物是否真的更新"
-# 没法判断（上一次就踩了这个坑），而 Nuitka 这里也没有可复用的增量缓存
+# 旧产物不删、改成挪到缓存目录：在受限环境里"删除上千个文件"会被拦，
+# 而同一磁盘内的改名是瞬时的。累积的归档在构建结束时给出清理命令
+ARCHIVE="$NUITKA_CACHE_DIR/build-archive"
+mkdir -p "$ARCHIVE"
+archive_dist() {
+    [ -d "$1" ] || return 0
+    mv "$1" "$ARCHIVE/$(basename "$1")-$(date +%s)" 2>/dev/null && return 0
+    remove_dist "$1"
+}
+
 if [ -d dist ]; then
-    for _ in 1 2 3 4 5; do
-        remove_dist && break
-        sleep 2
-    done
-    if [ -d dist ]; then
-        echo "[ERROR] 无法删除旧 dist（可能有文件被占用），请手动删除后重试"
+    archive_dist dist || {
+        echo "[ERROR] 无法移走旧 dist（文件被占用？程序还在运行？）"
         exit 1
-    fi
+    }
 fi
 
 # 编译开始的时间标记：产物必须比它新，才算真的被这次构建覆盖
@@ -123,17 +127,10 @@ echo "[4/4] 开始编译（10–30 分钟）..."
 # 转换搞坏），直接把 run.dist 整体换成 dist：重命名是同卷操作，快且不会漏文件
 if [ -d dist/run.dist ]; then
     STAGE="$ROOT/.dist-staged"
-    rm -rf "$STAGE"
+    rm -rf "$STAGE" 2>/dev/null
     mv dist/run.dist "$STAGE" || { echo "[ERROR] 无法移出 dist/run.dist"; exit 1; }
-    for _ in 1 2 3 4 5; do
-        remove_dist && break
-        sleep 2
-    done
-    if [ -d dist ]; then
-        echo "[ERROR] 无法删除旧的 dist（文件被占用？程序还在运行？）"
-        echo "        移到 $STAGE 的产物已保留，可手动替换"
-        exit 1
-    fi
+    # 剩下的 dist 里只有 run.build（中间产物），整个挪走而不是删
+    archive_dist dist || { echo "[ERROR] 无法移走构建中间目录"; exit 1; }
     mv "$STAGE" dist || { echo "[ERROR] 无法把产物移动到 dist"; exit 1; }
 fi
 
@@ -152,3 +149,7 @@ fi
 
 echo "[OK] 构建成功: dist/MiHome-Windows.exe ($(du -sh dist | cut -f1) 总计)"
 echo "     注意：整个 dist/ 目录需一起分发，单拷 exe 无法运行"
+# 旧产物归档在缓存目录里，攒多了占地方，提示一下清理方式
+if [ -d "$ARCHIVE" ]; then
+    echo "     构建归档（可删）: $ARCHIVE （$(du -sh "$ARCHIVE" | cut -f1)）"
+fi

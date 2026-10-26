@@ -244,7 +244,11 @@ def is_primary_slider(prop: PropInfo) -> bool:
 # ---------- 功能区块 ----------
 
 class PowerRowSection(QFrame):
-    """电源行卡片：属性名 + 状态文字 + 圆形电源钮，整行点击切换。"""
+    """电源行卡片：属性名 + 状态文字 + 圆形电源钮。
+
+    只有圆钮本身能切换。整行点击切换曾经很方便，但和"点卡片看详情"
+    的操作习惯冲突：用户点空白处想看信息，却把设备关了。
+    """
 
     def __init__(self, prop: PropInfo, write: Callable[[bool], None]):
         super().__init__()
@@ -253,7 +257,6 @@ class PowerRowSection(QFrame):
         self._current = False
         self.setObjectName("propCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setCursor(Qt.PointingHandCursor)
 
         self._circle = PowerButton(40, icon_size=32)
         self._circle.clicked.connect(self._toggle)
@@ -291,11 +294,6 @@ class PowerRowSection(QFrame):
 
     def refresh_value(self, value: Any) -> None:
         self._apply(bool(value))
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt 命名约定)
-        if event.button() == Qt.LeftButton:
-            self._toggle()
-        super().mouseReleaseEvent(event)
 
 
 class SliderSection(QFrame):
