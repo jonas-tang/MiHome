@@ -380,11 +380,13 @@ class DeviceDetailDialog(OverlayDialog):
         self._extra_panel: _PropPanel | None = None
 
         outer = QVBoxLayout(self._panel)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(12)
+        outer.setContentsMargins(16, 6, 16, 12)
+        outer.setSpacing(10)
         self._outer = outer
 
         # ---- 顶部：设备名 / 型号 + 关闭 ----
+        # ✕ 按钮绝对定位在面板右上角（见 resizeEvent）：普通设备详情的
+        # 表头行只剩它一个元素，为 28px 的按钮留一整行等于顶部空出一条带
         header = QHBoxLayout()
         header.setSpacing(12)
         title_box = QVBoxLayout()
@@ -401,8 +403,11 @@ class DeviceDetailDialog(OverlayDialog):
             " font-size: 8pt;")
         title_box.addWidget(self._sub_label)
         header.addLayout(title_box, stretch=1)
-        header.addWidget(self._make_close_button(), alignment=Qt.AlignmentFlag.AlignTop)
+        header.addSpacing(44)  # 给右上角的 ✕ 留出横向空间，防止长标题压到它
         outer.addLayout(header)
+        self._close_btn = self._make_close_button()
+        self._close_btn.setParent(self._panel)
+        self._close_btn.raise_()
 
         # ---- 工作台（普通设备的主视图；多通道设备只用它挂信号，不显示）----
         self._workbench = WorkbenchPanel(service, jobs, self._panel)
@@ -437,6 +442,8 @@ class DeviceDetailDialog(OverlayDialog):
         ]
         if not extras:
             self._extra_panel.hide()
+            self._workbench.set_body_visible(False)
+            self._fit_workbench_height()
             return
         # 可操作的排前面，只读的（滤芯寿命、状态这类）垫底
         extras.sort(key=lambda p: (0 if p.writable else 1, p.name))
@@ -444,12 +451,30 @@ class DeviceDetailDialog(OverlayDialog):
             # 工作台还空着：只留标题行（"编辑功能"入口仍在），
             # 把高度让给下面的完整参数列表
             self._workbench.set_body_visible(False)
-            index = self._outer.indexOf(self._workbench)
-            if index >= 0:
-                self._outer.setStretch(index, 0)
+        else:
+            self._workbench.set_body_visible(True)
+        self._workbench.setMinimumHeight(0)
+        self._fit_workbench_height()
         self._extra_panel.set_title("可配置参数", f"{len(extras)} 项")
         self._extra_panel.set_props(extras, detail.did)
         self._extra_panel.show()
+
+    def _fit_workbench_height(self) -> None:
+        """工作台按内容定高：body 放得下就不出滚动条，剩余高度给参数区。
+
+        需要的高度 = 面板固定部分（标题行等，用"当前高 - body视口高"测出）
+        + body 内容高度（工作台自己维护的列高，每列末尾多算了一个 14 的
+        间距）。上限 340：详情抽屉总共 640 高，工作台不能把参数区挤没了，
+        超出的部分让 body 自己滚。
+        """
+        wb = self._workbench
+        hint = wb.sizeHint().height()
+        viewport = wb._body.viewport().height()
+        if not wb._body.isHidden() and viewport > 0:
+            content = max(wb._left_h, wb._right_h) - 14
+            fixed = wb.height() - viewport
+            hint = fixed + max(content, 96)
+        wb.setFixedHeight(min(max(hint, 64), 340))
 
     # ---------- 多通道版面 ----------
 
@@ -627,6 +652,8 @@ class DeviceDetailDialog(OverlayDialog):
         x = (self.width() - pw) // 2
         y = (self.height() - ph) // 2
         self._panel.setGeometry(x, y, pw, ph)
+        # ✕ 固定在面板右上角，不占布局行
+        self._close_btn.move(self._panel.width() - self._close_btn.width() - 12, 6)
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)

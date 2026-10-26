@@ -70,7 +70,33 @@ _UNASSIGNED_ROOM = "未分配房间"
 _DEFAULT_CARD_COLUMNS = 4
 _ASPECT_W, _ASPECT_H = 16, 9
 # 与 setMinimumSize 的高度保持一致：16:9 反推宽度时不能低于它
-_WINDOW_MIN_HEIGHT = 520
+_WINDOW_MIN_HEIGHT = 460
+# 卡片网格的横纵间距：列数计算与默认窗口宽度都依赖它，改这里即可
+_GRID_SPACING = 12
+
+
+class _TabScrollArea(QScrollArea):
+    """房间页签的横向滚动区。
+
+    竖向滚动被禁用后，QScrollArea 对滚轮的默认处理就没了意义：竖向范围
+    恒为 0，事件却被它消费掉。而且实测（PySide6/QAbstractScrollArea）
+    子类重写 wheelEvent() 在常规事件路由下根本不会被调用——必须用视口
+    上的事件过滤器。这里把滚轮统一转成横向滚动：一格 120 → 滚 72px，
+    一次能翻过两三个页签；事件返回 True，竖向被彻底锁死。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt 命名约定)
+        if obj is self.viewport() and event.type() == QEvent.Type.Wheel:
+            delta = event.angleDelta().y()
+            if delta:
+                bar = self.horizontalScrollBar()
+                bar.setValue(bar.value() - int(delta * 0.6))
+            return True
+        return super().eventFilter(obj, event)
 
 # 外部（APP/语音/物理按键）改状态后卡片靠轮询跟随。
 # 3 秒：一次整批读约 0.3~0.8 秒（批次已提到 20 台/次），加上间隔后
@@ -193,7 +219,7 @@ class MainWindow(QMainWindow):
         # 默认窗口尺寸在首次显示时按真实 DPR 应用（见 showEvent）：
         # 构造期窗口未创建，DPR 读数不可靠（曾导致默认尺寸放大一圈）
         self._default_size_applied = False
-        self.setMinimumSize(760, 520)
+        self.setMinimumSize(720, 460)
 
         self._all_devices: list[DeviceInfo] = []
         self._cards: dict[str, DeviceCard] = {}
@@ -329,8 +355,8 @@ class MainWindow(QMainWindow):
         body.setSpacing(0)
 
         content = QVBoxLayout()
-        content.setContentsMargins(24, 16, 24, 8)
-        content.setSpacing(10)
+        content.setContentsMargins(24, 8, 24, 6)
+        content.setSpacing(8)
 
         # ---- 顶栏：家庭切换器 + 刷新 ----
         top_bar = QHBoxLayout()
@@ -374,7 +400,9 @@ class MainWindow(QMainWindow):
         btn_wrapper = QWidget()
         btn_wrapper.setStyleSheet("background: transparent;")
         btn_layout = QHBoxLayout(btn_wrapper)
-        btn_layout.setContentsMargins(0, 30, 25, 0)
+        # 以前给 30px 上边距，把图标按钮往下压出一条空带；标题栏本来就是
+        # 独立的一条 32px，图标与「全部」同行即可
+        btn_layout.setContentsMargins(0, 0, 20, 0)
         btn_layout.setSpacing(2)
         btn_layout.addWidget(self._refresh_btn)
         btn_layout.addWidget(self._settings_btn)
@@ -382,11 +410,23 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(btn_wrapper)
         content.addLayout(top_bar)
 
-        # ---- 房间 tab 行 ----
+        # ---- 房间 tab 行：宽度随文字自适应，超出窗口可横向滚动 ----
         self._tab_row = QHBoxLayout()
-        self._tab_row.setSpacing(14)
+        # 间距 14 → 5：房间多时一排放不下，间距是首要的可压缩项
+        self._tab_row.setSpacing(5)
         self._tab_buttons: dict[str, SiToggleButtonRefactor] = {}
-        content.addLayout(self._tab_row)
+        tab_host = QWidget()
+        tab_host.setStyleSheet("background: transparent;")
+        tab_host.setLayout(self._tab_row)
+        self._tab_scroll = _TabScrollArea()
+        self._tab_scroll.setWidgetResizable(True)
+        self._tab_scroll.setFrameShape(QFrame.NoFrame)
+        self._tab_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._tab_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._tab_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self._tab_scroll.setWidget(tab_host)
+        self._tab_scroll.setFixedHeight(56)
+        content.addWidget(self._tab_scroll)
 
         # ---- 环境状态胶囊：房间栏下方一行，点击看明细 ----
         self._temp_pill = self._make_status_pill(
@@ -416,8 +456,8 @@ class MainWindow(QMainWindow):
         # deleteLater 的延迟执行陷入死循环
         from PySide6.QtWidgets import QGridLayout
         self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(0, 4, 0, 12)
-        self._grid.setSpacing(14)
+        self._grid.setContentsMargins(0, 0, 0, 8)
+        self._grid.setSpacing(_GRID_SPACING)
         self._scroll.setWidget(self._grid_host)
         # 垂直滚动条显隐会改变视口宽度但不触发窗口 resizeEvent，
         # 监听视口自身尺寸变化，否则列数校验漏掉这类宽度变化
@@ -1859,6 +1899,12 @@ class MainWindow(QMainWindow):
             btn = themed_tab_button(room)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _, r=room: self._select_room(r))
+            # 宽度随文字：siui 按钮的 sizeHint 在文字变长后跟不上
+            # （"储藏室"需要 39px，按钮被布局压到 33px 就截字），
+            # polished 之后按真实字体量宽再加左右内边距
+            btn.ensurePolished()
+            from PySide6.QtGui import QFontMetrics
+            btn.setFixedWidth(max(52, QFontMetrics(btn.font()).horizontalAdvance(room) + 22))
             self._tab_row.addWidget(btn)
             self._tab_buttons[room] = btn
         self._tab_row.addStretch(1)
@@ -1996,7 +2042,7 @@ class MainWindow(QMainWindow):
         holder.setStyleSheet("background: transparent;")
         lay = QHBoxLayout(holder)
         # 上边距承担段间距：网格 spacing 对跨列条目不生效，只能自己留白
-        lay.setContentsMargins(4, 18, 12, 2)
+        lay.setContentsMargins(4, 10, 12, 2)
         lay.setSpacing(8)
 
         name = QLabel(title)
@@ -2084,7 +2130,7 @@ class MainWindow(QMainWindow):
     def _columns_for_width(self, width: int) -> int:
         # 固定卡片宽度，列数随可视宽度动态计算，避免缩窄时卡片被裁切
         from app.ui.device_card import _CARD_FIXED_WIDTH
-        spacing = 14
+        spacing = _GRID_SPACING
         right_margin = 12
         eff = max(0, width - right_margin)
         if eff <= 0:
@@ -2103,7 +2149,7 @@ class MainWindow(QMainWindow):
         而不是 924×520 那种近似值，同时不低于窗口最小高度。
         """
         from app.ui.device_card import _CARD_FIXED_WIDTH
-        spacing = 14
+        spacing = _GRID_SPACING
         right_margin = 12
         content_margins = 24 * 2  # content 布局左右边距（构造处设置）
         eff = _DEFAULT_CARD_COLUMNS * (_CARD_FIXED_WIDTH + spacing) - spacing

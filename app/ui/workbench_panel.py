@@ -107,7 +107,7 @@ class WorkbenchPanel(QWidget):
         self._last_written_time: dict[str, float] = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 16)
+        root.setContentsMargins(16, 8, 16, 12)
         root.setSpacing(12)
 
         # 离线条
@@ -312,10 +312,16 @@ class WorkbenchPanel(QWidget):
         valid = {k for k, _, _ in self._module_defs}
         keys = [k for k in keys if k in valid]
         self._active_keys = keys
-        self._render_workbench()
         self._refresh_btn.show()
         self._edit_btn.show()
-        self.detail_loaded.emit(detail)
+        self._rerender()
+
+    def _rerender(self) -> None:
+        """重绘工作台并通知：编辑功能里增删/拖动模块后也会走到这里，
+        详情页要跟着重新计算工作台高度。"""
+        self._render_workbench()
+        if self._detail is not None:
+            self.detail_loaded.emit(self._detail)
 
     def _default_keys(self) -> list[str]:
         # 优先选择独立的 on 开关（最常用的控制方式）
@@ -612,14 +618,14 @@ class WorkbenchPanel(QWidget):
         workbench_store.save(self._current_did, self._active_keys)
         if self._drawer is not None:
             self._drawer.mark_added(key)
-        self._render_workbench()
+        self._rerender()
 
     def _on_delete(self, key: str) -> None:
         if key not in self._active_keys or self._current_did is None:
             return
         self._active_keys.remove(key)
         workbench_store.save(self._current_did, self._active_keys)
-        self._render_workbench()
+        self._rerender()
 
     def _on_move(self, key: str, direction: int) -> None:
         if key not in self._active_keys or self._current_did is None:
@@ -656,7 +662,7 @@ class WorkbenchPanel(QWidget):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
         if self._detail is not None:
-            self._render_workbench()
+            self._rerender()
 
     def _toggle_manage(self) -> None:
         self._set_mode("normal" if self._mode == "manage" else "manage")

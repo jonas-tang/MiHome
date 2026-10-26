@@ -29,12 +29,12 @@ from app.core.models import DeviceInfo
 from app.ui.power_button import PowerButton
 from app.ui.si_theme import SiColors
 
-_POWER_BTN_SIZE = 36
-_ICON_SIZE = 36
-# 卡片固定宽度与主窗口默认一排放几列联动（见 MainWindow._default_window_size），
-# 调窄后默认窗口宽度下恰好 5 列
-_CARD_FIXED_WIDTH = 200
-_CARD_FIXED_HEIGHT = 92
+_POWER_BTN_SIZE = 32
+_ICON_SIZE = 32
+# 卡片固定尺寸与主窗口默认一排放几列联动（见 MainWindow._default_window_size）。
+# 200×92 → 180×83：整体紧凑 10%，默认窗口宽度按 4 列反推
+_CARD_FIXED_WIDTH = 180
+_CARD_FIXED_HEIGHT = 83
 
 # 离线卡片的灰置配色：背景更暗、文字更灰，hover 不提亮
 
@@ -60,6 +60,8 @@ class DeviceCard(SiRowCard):
         self._power_enabled = power_enabled
         # 设备名按实际宽度缩过字号没有（只在首次显示时算一次）
         self._name_fitted = False
+        # 实时读数（None=还没有）；真正写进副标题要等布局给出宽度
+        self._metrics_text: str | None = None
 
         self.style_data.background_color = QColor(
             SiColors.OFFLINE_CARD if not self._online else SiColors.CARD)
@@ -121,8 +123,10 @@ class DeviceCard(SiRowCard):
         lay.setContentsMargins(14, 10, 18, 10)
         lay.addWidget(self._icon_label, alignment=Qt.AlignVCenter)
         lay.addSpacing(10)
-        lay.addWidget(text_col)
-        lay.addStretch(1)
+        # 文字列吃掉图标与电源钮之间的全部剩余宽度：以前它后面跟着
+        # addStretch(1)，文字列只剩 sizeHint 宽（短名字才 26px），
+        # 读数"26.4°C 59%"被裁掉一截、长名字也更容易溢出
+        lay.addWidget(text_col, stretch=1)
         lay.addWidget(self._power_btn, alignment=Qt.AlignVCenter)
 
     # ---------- 名称排版 ----------
@@ -135,6 +139,13 @@ class DeviceCard(SiRowCard):
         if not self._name_fitted:
             self._name_fitted = True
             self._fit_name_font()
+        self._sync_sub()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名约定)
+        super().resizeEvent(event)
+        # 卡片固定尺寸下只发生一次；滚动条显隐改变视口宽度时也会进来
+        self._fit_name_font()
+        self._sync_sub()
 
     def _fit_name_font(self) -> None:
         """名称最多两行，放不下就把尾部截掉加省略号。
@@ -218,7 +229,23 @@ class DeviceCard(SiRowCard):
         # 离线设备不展示温湿度，读数可能是旧缓存
         if not self._online:
             return
-        self._sub_label.setText(self._sub_text(text))
+        self._metrics_text = text
+        self._sync_sub()
+
+    def _sync_sub(self) -> None:
+        """按当前宽度拼副标题：放不下就收省略号。
+
+        不在 set_metrics 里直接做的原因：网格重建时标签宽度还是 0，
+        只有等到布局完成（resize/show）才知道实际能放多宽。
+        """
+        width = self._sub_label.width()
+        if width <= 0:
+            return
+        text = self._sub_text(self._metrics_text)
+        elided = QFontMetrics(self._sub_label.font()).elidedText(
+            text, Qt.TextElideMode.ElideRight, width)
+        if elided != text and self._sub_label.text() != elided:
+            self._sub_label.setText(elided)
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
