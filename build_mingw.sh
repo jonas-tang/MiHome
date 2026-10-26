@@ -82,12 +82,14 @@ archive_dist() {
     remove_dist "$1"
 }
 
-if [ -d dist ]; then
-    archive_dist dist || {
-        echo "[ERROR] 无法移走旧 dist（文件被占用？程序还在运行？）"
-        exit 1
-    }
-fi
+# 归档只留最近一份：每次构建都会把上一版 dist 挪进来，不清理会越攒越大
+prune_archive() {
+    [ -d "$ARCHIVE" ] || return 0
+    ls -1dt "$ARCHIVE"/*/ 2>/dev/null | tail -n +2 | while read -r old; do
+        rm -rf "$old" 2>/dev/null
+        [ -d "$old" ] && "$PY" -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$old" 2>/dev/null
+    done
+}
 
 # 编译开始的时间标记：产物必须比它新，才算真的被这次构建覆盖
 STAMP="$NUITKA_CACHE_DIR/.build-started"
@@ -95,7 +97,27 @@ touch "$STAMP"
 
 TRANS="$ROOT/.venv/Lib/site-packages/PySide6/translations"
 
-echo "[4/4] 开始编译（10–30 分钟）..."
+# C 编译器并发数：原来硬编码 --jobs=4，这台机器 18 核明显浪费。
+# 但也不是越多越好——12 路时 ccache 写每模块统计文件会撞车
+# （ccache: error: Failed to write ...ccache-<pid>.txt: Permission denied），
+# 整轮编译直接失败。8 路实测稳定。
+# 默认 8，可用环境变量覆盖：JOBS=6 bash build_mingw.sh
+JOBS="${JOBS:-8}"
+
+# 产物目录放在缓存里且**长期保留**，这里有三条铁律（改脚本时别破坏）：
+#   1. 不要删 $OUT_DIR —— 里面的 run.build/ 是 scons 的中间产物
+#      （生成的 .c/.o 与 .sconsign 签名库），删了就必须从零重编；
+#   2. 不要加 --remove-output —— 它会在编译前清掉同一个目录；
+#   3. 不要加 --clean-cache —— 那是把 Nuitka 自己的缓存也一起丢掉。
+# 另外 Nuitka 4.x 在 Windows 上会自动下载并挂上 ccache（--assume-yes-for-
+# downloads 允许它下载，产物在 .nuitka-cache/ccache），实测 484 个 .o
+# 全部 cache hit，C 编译这一阶段基本不花时间；所以不要再手工指定 CC。
+OUT_DIR="$NUITKA_CACHE_DIR/out"
+mkdir -p "$OUT_DIR"
+
+echo "[4/4] 开始编译（首次或改动较多时几分钟到十几分钟，改了少数模块会快很多）..."
+echo "      C 编译并发: $JOBS 路（可用 JOBS=N 覆盖）"
+BUILD_T0=$(date +%s)
 "$PY" -m nuitka run.py \
     --standalone \
     --enable-plugin=pyside6 \
@@ -112,25 +134,31 @@ echo "[4/4] 开始编译（10–30 分钟）..."
     --nofollow-import-to=tools,tests \
     --noinclude-dlls=qt6datavisualization.dll \
     --noinclude-dlls=qt6pdf.dll \
-    --jobs=4 \
+    --jobs="$JOBS" \
     --assume-yes-for-downloads \
-    --output-dir=dist \
+    --output-dir="$OUT_DIR" \
     --output-filename=MiHome-Windows.exe \
     --product-name=MiHome-Windows \
     --product-version=0.4.0 \
     --file-version=0.4.0 \
     --copyright="Copyright (C) 2026 MiHome-Windows contributors" \
     --mingw64 || { echo "[ERROR] 编译失败"; exit 1; }
+echo "      编译耗时 $(( $(date +%s) - BUILD_T0 ))s"
 
-# Nuitka 把产物放在 dist/run.dist，而交付形态是"dist 根目录下直接躺 exe"。
+# 交付形态是"dist 根目录下直接躺 exe"，而 Nuitka 把内容放在 run.dist。
 # 这里不逐个文件搬（cp 会吞掉覆盖失败、robocopy 的 /开关 会被 MSYS 的路径
-# 转换搞坏），直接把 run.dist 整体换成 dist：重命名是同卷操作，快且不会漏文件
-if [ -d dist/run.dist ]; then
+# 转换搞坏），直接把 run.dist 整体换成 dist：重命名是同卷操作，快且不会漏文件。
+# run.build 留在 $OUT_DIR 里不动，下次构建靠它增量。
+if [ -d "$OUT_DIR/run.dist" ]; then
     STAGE="$ROOT/.dist-staged"
     rm -rf "$STAGE" 2>/dev/null
-    mv dist/run.dist "$STAGE" || { echo "[ERROR] 无法移出 dist/run.dist"; exit 1; }
-    # 剩下的 dist 里只有 run.build（中间产物），整个挪走而不是删
-    archive_dist dist || { echo "[ERROR] 无法移走构建中间目录"; exit 1; }
+    mv "$OUT_DIR/run.dist" "$STAGE" || { echo "[ERROR] 无法移出 run.dist"; exit 1; }
+    # 旧产物在**构建成功之后**才挪走：上面任何一步失败都保留上一版 dist，
+    # 不能让人"构建失败 + 没有可运行的程序"
+    if [ -d dist ]; then
+        archive_dist dist || { echo "[ERROR] 无法移走旧 dist"; exit 1; }
+        prune_archive
+    fi
     mv "$STAGE" dist || { echo "[ERROR] 无法把产物移动到 dist"; exit 1; }
 fi
 
