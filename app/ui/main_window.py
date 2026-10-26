@@ -66,6 +66,11 @@ _SCENE_TAB = "场景"
 # 米家里没分到房间的设备：房间 tab 里不出现（点它没有意义），
 # 但「全屋」分组视图必须有个落点，否则这些设备会凭空消失
 _UNASSIGNED_ROOM = "未分配房间"
+# 首屏默认布局：一排正好 _DEFAULT_CARD_COLUMNS 个卡片，窗口整体 16:9
+_DEFAULT_CARD_COLUMNS = 4
+_ASPECT_W, _ASPECT_H = 16, 9
+# 与 setMinimumSize 的高度保持一致：16:9 反推宽度时不能低于它
+_WINDOW_MIN_HEIGHT = 520
 
 # 外部（APP/语音/物理按键）改状态后卡片靠轮询跟随。
 # 3 秒：一次整批读约 0.3~0.8 秒（批次已提到 20 台/次），加上间隔后
@@ -2089,31 +2094,34 @@ class MainWindow(QMainWindow):
         return max(1, cols)
 
     @staticmethod
-    def _default_window_width() -> int:
-        """默认窗口逻辑宽：首屏恰好一排 5 个卡片。
+    def _default_window_size() -> tuple[int, int]:
+        """默认窗口逻辑尺寸：首屏一排正好 4 个卡片，整体 16:9。
 
-        与 _columns_for_width 同一套列宽/间距/边距口径反推，再留一个
-        间距的余量吸收取整与滚动条宽度差异。卡片宽度或边距调整时
-        自动跟随，避免两处数值各自漂移。
+        宽度先按"几张卡片并排"反推（与 _columns_for_width 同一套列宽/
+        间距/边距口径，再多留一个间距吸收取整与滚动条差异），再把宽高
+        一起取整到 16:9 的整数倍（宽 16k、高 9k）——这样比例是精确的
+        而不是 924×520 那种近似值，同时不低于窗口最小高度。
         """
         from app.ui.device_card import _CARD_FIXED_WIDTH
         spacing = 14
         right_margin = 12
         content_margins = 24 * 2  # content 布局左右边距（构造处设置）
-        eff = 5 * (_CARD_FIXED_WIDTH + spacing) - spacing
-        return eff + right_margin + content_margins + spacing
+        eff = _DEFAULT_CARD_COLUMNS * (_CARD_FIXED_WIDTH + spacing) - spacing
+        needed = eff + right_margin + content_margins + spacing
+        # 向上取整的两种约束：装得下这么多卡片、高度不低于最小尺寸
+        k = max(-(-needed // _ASPECT_W), -(-_WINDOW_MIN_HEIGHT // _ASPECT_H))
+        return k * _ASPECT_W, k * _ASPECT_H
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt 命名约定)
         super().showEvent(event)
-        # 首次显示：应用默认窗口尺寸（宽度按逻辑像素取首屏一排 5 个
-        # 卡片所需值，高度按 1200 物理像素折算），并居中于所在屏幕的
-        # 可用区域。首次启动时 DPR 读数不可靠（曾导致尺寸异常），故
-        # 延迟到 showEvent——此时原生窗口已创建、读数准确。之后的
-        # 托盘唤出保持上次位置
+        # 首次显示：应用默认窗口尺寸（一排正好 4 个卡片、整体 16:9），
+        # 并居中于所在屏幕的可用区域。首次启动时 DPR 读数不可靠（曾导致
+        # 尺寸异常），故延迟到 showEvent——此时原生窗口已创建、读数准确。
+        # 之后的托盘唤出保持上次位置
         if not self._default_size_applied:
             self._default_size_applied = True
-            dpr = self.devicePixelRatioF() or 1.0
-            self.resize(self._default_window_width(), round(1200 / dpr))
+            width, height = self._default_window_size()
+            self.resize(width, height)
             from PySide6.QtGui import QGuiApplication
             screen = self.screen() or QGuiApplication.primaryScreen()
             avail = screen.availableGeometry()

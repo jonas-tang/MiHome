@@ -31,7 +31,7 @@ from app.ui.si_theme import SiColors
 
 _POWER_BTN_SIZE = 36
 _ICON_SIZE = 36
-# 卡片固定宽度与主窗口默认一排放几列联动（见 MainWindow._default_window_width），
+# 卡片固定宽度与主窗口默认一排放几列联动（见 MainWindow._default_window_size），
 # 调窄后默认窗口宽度下恰好 5 列
 _CARD_FIXED_WIDTH = 200
 _CARD_FIXED_HEIGHT = 92
