@@ -700,6 +700,25 @@ class GroupSection(QFrame):
         self._set_children_enabled(state)
 
 
+def usable_slider_range(prop: PropInfo) -> tuple[int, int, int] | None:
+    """滑块可用的区间；规格值越界/倒置时返回 None（调用方退回只读展示）。
+
+    真实出现过 range=4294967295（无符号 -1 的解析残留）的属性：
+    setRange 一执行就是 OverflowError，且会把整个参数面板的构建中断。
+    """
+    if not prop.range or len(prop.range) != 3:
+        return None
+    try:
+        low, high, step = (int(v) for v in prop.range)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (-2**31 <= low < high <= 2**31 - 1):
+        return None
+    if high - low > 10**7:  # 跨度大到一个数字滑块没有操作意义
+        return None
+    return low, high, step
+
+
 def build_prop_section(prop: PropInfo, write: Callable[[Any], None]) -> QWidget:
     """按元数据生成功能区块；write 在用户确认修改时收到新值。
 
@@ -711,7 +730,8 @@ def build_prop_section(prop: PropInfo, write: Callable[[Any], None]) -> QWidget:
         return PowerRowSection(prop, write)
     if prop.writable and prop.value_list:
         return EnumGridSection(prop, write)
-    if prop.writable and prop.range and prop.type in ("int", "uint", "float"):
+    if prop.writable and prop.type in ("int", "uint", "float") \
+            and usable_slider_range(prop) is not None:
         return SliderSection(prop, write)
     if prop.writable:
         # 可写字符串：输入框可编辑；可写裸数值（无 range/无枚举）展示为

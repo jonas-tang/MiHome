@@ -420,7 +420,10 @@ class DeviceDetailDialog(OverlayDialog):
         else:
             self._title_label.hide()
             self._sub_label.hide()
+            # AlignTop：工作台被 _fit_workbench_height 定高后，布局默认会
+            # 把它垂直居中，上下各空出一条大带（用户截图里的红框）
             outer.addWidget(self._workbench, stretch=1)
+            self._outer.setAlignment(self._workbench, Qt.AlignmentFlag.AlignTop)
             self._extra_panel = _PropPanel(service, jobs, "可配置参数", self._panel)
             self._extra_panel.hide()
             # 参数区占大头：工作台上通常只放少数几个常用功能，
@@ -458,6 +461,7 @@ class DeviceDetailDialog(OverlayDialog):
         self._extra_panel.set_title("可配置参数", f"{len(extras)} 项")
         self._extra_panel.set_props(extras, detail.did)
         self._extra_panel.show()
+        self._place_panel()
 
     def _fit_workbench_height(self) -> None:
         """工作台按内容定高：body 放得下就不出滚动条，剩余高度给参数区。
@@ -645,14 +649,31 @@ class DeviceDetailDialog(OverlayDialog):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._place_overlay()
-        # 居中面板：宽度 900，窗口过窄时自适应收缩
-        pw = 900
-        pw = min(pw, max(320, self.width() - 40))
-        ph = min(640, self.height() - 40)
+        self._place_panel()
+
+    def _place_panel(self) -> None:
+        """摆放居中面板。高度按内容算：工作台已被定高，参数区可见时吃掉
+        剩余、不可见（无其它参数）时面板整体收短——否则面板下方是一大片
+        无意义的空白，而工作台又被布局垂直居中、头顶再空出一条带。
+        """
+        pw = min(900, max(320, self.width() - 40))
+        if self._channels:
+            ph = min(640, self.height() - 40)
+        else:
+            wb_h = self._workbench.height()
+            extras = self._extra_panel is not None and self._extra_panel.isVisible()
+            chrome = 6 + 12 + 10  # 面板上下边距 + 与工作台的间距
+            if extras:
+                ph = min(640, max(chrome + wb_h + 240, 420))
+            else:
+                ph = max(chrome + wb_h, 200)
+            ph = min(ph, self.height() - 40)
         x = (self.width() - pw) // 2
         y = (self.height() - ph) // 2
         self._panel.setGeometry(x, y, pw, ph)
-        # ✕ 固定在面板右上角，不占布局行
+        # ✕ 固定在面板右上角，不占布局行；置顶防止被后创建的工作台面板
+        # （带背景色）盖住下半截
+        self._close_btn.raise_()
         self._close_btn.move(self._panel.width() - self._close_btn.width() - 12, 6)
 
     def showEvent(self, event) -> None:  # noqa: N802

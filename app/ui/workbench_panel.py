@@ -145,6 +145,9 @@ class WorkbenchPanel(QWidget):
         self._edit_btn.clicked.connect(self._toggle_manage)
         self._edit_btn.hide()
         header.addWidget(self._edit_btn)
+        # 右侧留出 ✕ 按钮的宽度：详情抽屉里 ✕ 绝对定位在面板右上角，
+        # 「刷新/编辑功能」顶到最右会被它压住一角
+        header.addSpacing(36)
         self._apply_header_button_styles()
         root.addLayout(header)
 

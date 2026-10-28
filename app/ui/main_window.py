@@ -1965,13 +1965,14 @@ class MainWindow(QMainWindow):
         )
         cols = self._columns_for_width(self._scroll.viewport().width())
         self._grid_columns = cols
-        # 「全屋」是默认视图，设备一多就是一片无差别的卡片墙，找一台
-        # 客厅的灯得靠肉眼扫。分组只在这一视图生效；已经点进具体房间
-        # 时范围本就收窄，再加一层标题纯属重复（多家庭同名房间也一样）。
+        # 分组只在"多于一段"时出现：
+        # - 「全屋」视图按（家庭, 房间）分段，设备多时不至于糊成卡片墙；
+        # - 具体房间在多个家庭都有同名房间时（两套房子的「主卧」）也分段，
+        #   平铺会把两家的设备混在一起，段标题带家庭前缀区分
         # 只有一组时不加标题：账号里一台设备都没分房间时，"未分配房间"
         # 这一行标题没有提供任何信息。
         groups = self._room_groups(visible)
-        if self._current_room == _ALL_ROOMS and len(groups) > 1:
+        if len(groups) > 1:
             rows = self._fill_grouped_grid(groups, cols)
         else:
             rows = self._fill_flat_grid(visible, cols)

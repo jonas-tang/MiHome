@@ -62,33 +62,17 @@ else
     echo "[3/4] MinGW 工具链已缓存"
 fi
 
-# 删除产物目录：某些环境会拦截 shell 的批量 rm（一次上千个文件算"批量删除"），
-# 改走 Python 的文件 API，行为等价且不受 shell 规则影响
-remove_dist() {
-    rm -rf dist 2>/dev/null
-    [ -d dist ] || return 0
-    "$PY" -c "import shutil; shutil.rmtree('dist', ignore_errors=True)" 2>/dev/null
-    [ -d dist ] || return 0
-    return 1
-}
-
-# 旧产物不删、改成挪到缓存目录：在受限环境里"删除上千个文件"会被拦，
-# 而同一磁盘内的改名是瞬时的。累积的归档在构建结束时给出清理命令
+# 旧产物**只挪不删**：在受限环境里"删除上千个文件"会被安全机制拦下，
+# 而且被拦的文件不是消失、是被整个转存进 modify_backup（一次就能攒出
+# 3.4GB 的构建垃圾）。同一磁盘内的改名不涉及删除，瞬时且无此副作用。
+# 归档会越攒越大，清理是手动动作（见脚本末尾的提示），绝不自动删。
 ARCHIVE="$NUITKA_CACHE_DIR/build-archive"
 mkdir -p "$ARCHIVE"
 archive_dist() {
     [ -d "$1" ] || return 0
     mv "$1" "$ARCHIVE/$(basename "$1")-$(date +%s)" 2>/dev/null && return 0
-    remove_dist "$1"
-}
-
-# 归档只留最近一份：每次构建都会把上一版 dist 挪进来，不清理会越攒越大
-prune_archive() {
-    [ -d "$ARCHIVE" ] || return 0
-    ls -1dt "$ARCHIVE"/*/ 2>/dev/null | tail -n +2 | while read -r old; do
-        rm -rf "$old" 2>/dev/null
-        [ -d "$old" ] && "$PY" -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$old" 2>/dev/null
-    done
+    echo "[ERROR] 无法移走 $1（文件被占用？程序还在运行？）"
+    exit 1
 }
 
 # 编译开始的时间标记：产物必须比它新，才算真的被这次构建覆盖
@@ -151,13 +135,13 @@ echo "      编译耗时 $(( $(date +%s) - BUILD_T0 ))s"
 # run.build 留在 $OUT_DIR 里不动，下次构建靠它增量。
 if [ -d "$OUT_DIR/run.dist" ]; then
     STAGE="$ROOT/.dist-staged"
-    rm -rf "$STAGE" 2>/dev/null
+    # 上次失败遗留的暂存目录同样只挪不删
+    [ -d "$STAGE" ] && mv "$STAGE" "$ARCHIVE/staged-$(date +%s)" 2>/dev/null
     mv "$OUT_DIR/run.dist" "$STAGE" || { echo "[ERROR] 无法移出 run.dist"; exit 1; }
     # 旧产物在**构建成功之后**才挪走：上面任何一步失败都保留上一版 dist，
     # 不能让人"构建失败 + 没有可运行的程序"
     if [ -d dist ]; then
         archive_dist dist || { echo "[ERROR] 无法移走旧 dist"; exit 1; }
-        prune_archive
     fi
     mv "$STAGE" dist || { echo "[ERROR] 无法把产物移动到 dist"; exit 1; }
 fi
