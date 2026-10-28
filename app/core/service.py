@@ -701,6 +701,8 @@ class MijiaService:
         匹配 SI 标准属性：temperature 与 relative-humidity（个别型号
         也叫 humidity），读不到的设备返回 None（副标题维持纯房间名）。
         多通道设备的同名属性取第一个通道。
+        只采集"环境温度"：插座报的是内部器件温度、净水器报的是进水温度，
+        机型与量程两层筛掉（见 is_ambient_source / _ambient_range_ok）。
         """
         spec_map = self._specs_for(dids)
         queries: list[dict] = []
@@ -709,6 +711,10 @@ class MijiaService:
         for did in dids:
             info = spec_map.get(did)
             found: dict[str, dict] = {}
+            if info and not is_ambient_source(
+                    info.get("spec_type"), info.get("name"), did):
+                result[did] = None
+                continue
             if info:
                 for prop in info.get("properties", []):
                     name = prop.get("name")
@@ -717,6 +723,8 @@ class MijiaService:
                         else "humidity" if name in ("relative-humidity", "humidity")
                         else None
                     )
+                    if metric == "temperature" and not _ambient_range_ok(prop.get("range")):
+                        continue
                     if metric and "r" in prop.get("rw", "") and metric not in found:
                         found[metric] = prop["method"]
             if not found:
@@ -1075,6 +1083,31 @@ class MijiaService:
             if spec_name and has_cjk(spec_name) and spec_name != name:
                 result[did] = spec_name
         return result
+
+
+# 会报温度但测的不是室温的机型：插座报的是自身内部器件温度（常年 40°C+），
+# 净水器报的是进水温度。让它们参与"室温"比较会把胶囊带偏，源头就挡掉。
+# 关键字同时要覆盖型号（xiaomi.waterpuri.s1600g）与规格 URN
+# （urn:miot-spec-v2:device:water-purifier:...）两种写法。
+_NON_AMBIENT_MODEL_KEYWORDS = (
+    "plug", "powerstrip", "power-strip", "socket", "waterpuri", "water-purifier",
+)
+
+
+def is_ambient_source(*identifiers: str | None) -> bool:
+    """这些标识（型号/规格 URN/名称）描述的机型报的是否环境温湿度。"""
+    text = " ".join(i for i in identifiers if i).lower()
+    return not any(key in text for key in _NON_AMBIENT_MODEL_KEYWORDS)
+
+
+def _ambient_range_ok(rng) -> bool:
+    """温度量程能装下室温才算环境温度（插座内部温度量程高到 255°C）。"""
+    if not rng or len(rng) < 2:
+        return True
+    try:
+        return float(rng[1]) <= 150
+    except (TypeError, ValueError):
+        return True
 
 
 def format_metrics_text(temp, hum) -> str | None:

@@ -43,7 +43,7 @@ from app.core import icon_store, schedule_store
 from app.core.jobs import PRIORITY_CONTROL, PRIORITY_IDLE, JobExecutor
 from app.core.models import DeviceInfo, SceneInfo, is_speaker
 from app.core.scheduler import Scheduler
-from app.core.service import MijiaService
+from app.core.service import MijiaService, format_metrics_text
 from app.ui.board_manager import BoardManagerDialog
 from app.ui.device_card import DeviceCard
 from app.ui.device_dialog import DeviceDetailDialog
@@ -145,6 +145,16 @@ def _split_metrics(text: str) -> tuple[str, str]:
         elif part.endswith("%"):
             humidity = part
     return temp, humidity
+
+
+def _parse_metric(text: str) -> float | None:
+    """"26.0°C" / "65%" → 26.0 / 65.0；空串或不可解析返回 None。"""
+    if not text:
+        return None
+    try:
+        return float(text.rstrip("°C%"))
+    except ValueError:
+        return None
 
 
 class _IconButton(QPushButton):
@@ -430,9 +440,11 @@ class MainWindow(QMainWindow):
 
         # ---- 环境状态胶囊：房间栏下方一行，点击看明细 ----
         self._temp_pill = self._make_status_pill(
-            "mdi.thermometer", "当前范围的温度", self._show_env_detail)
+            "mdi.thermometer", "当前范围的温度",
+            lambda: self._show_env_detail("temp"))
         self._humidity_pill = self._make_status_pill(
-            "mdi.water-percent", "当前范围的湿度", self._show_env_detail)
+            "mdi.water-percent", "当前范围的湿度",
+            lambda: self._show_env_detail("humidity"))
         self._light_pill = self._make_status_pill(
             "mdi.power", "当前范围内开启的设备", self._show_light_detail)
         self._consumable_pill = self._make_status_pill(
@@ -1481,33 +1493,39 @@ class MainWindow(QMainWindow):
             f'&nbsp;&nbsp;<span style="color:{online_dot}">●</span>'
             f'&nbsp;<span style="color:{muted}">{online} 台在线</span>'
         )
-        self._update_status_pills(subset)
+        # 胶囊统计含被合并的通道：它们不在网格里单独成卡，
+        # 但读数是房间真实的温湿度
+        self._update_status_pills(self._visible_subset(include_channels=True))
 
     def _update_status_pills(self, subset: list[DeviceInfo]) -> None:
         """刷新环境状态胶囊。
 
-        温湿度按"第一个有读数的设备"取值：全屋时是列表里第一台温湿度计，
-        切到某个房间后自然变成该房间内的第一台，不需要额外聚合。
+        温湿度取"当前范围内**在线**设备的最小值"：最小值代表这一区域里
+        最凉/最干的位置，比"排在最前的那台"稳定得多（后者会随设备改名、
+        换设备而跳变）。离线设备不参与——它们的读数是过期缓存。
         开启数只统计当前范围内状态确认为开的设备。
         """
-        # 温度与湿度分开显示：取第一个能读到对应数值的设备
-        temp_text = ""
-        humidity_text = ""
+        temps: list[float] = []
+        hums: list[float] = []
         for device in subset:
+            if not device.online:
+                continue
             value = self._metrics.get(device.did)
             if not value:
                 continue
-            temp, humidity = _split_metrics(value)
-            if not temp_text and temp:
-                temp_text = temp
-            if not humidity_text and humidity:
-                humidity_text = humidity
-            if temp_text and humidity_text:
-                break
-        self._temp_pill.setText(temp_text)
-        self._temp_pill.setVisible(bool(temp_text))
-        self._humidity_pill.setText(humidity_text)
-        self._humidity_pill.setVisible(bool(humidity_text))
+            temp_text, hum_text = _split_metrics(value)
+            temp = _parse_metric(temp_text)
+            hum = _parse_metric(hum_text)
+            if temp is not None:
+                temps.append(temp)
+            if hum is not None:
+                hums.append(hum)
+        temp_label = format_metrics_text(min(temps), None) if temps else ""
+        hum_label = format_metrics_text(None, min(hums)) if hums else ""
+        self._temp_pill.setText(temp_label or "")
+        self._temp_pill.setVisible(bool(temp_label))
+        self._humidity_pill.setText(hum_label or "")
+        self._humidity_pill.setVisible(bool(hum_label))
 
         lights = sum(1 for d in subset if self._known_power.get(d.did) is True)
         self._light_pill.setText(f"开启 {lights}")
@@ -1532,9 +1550,9 @@ class MainWindow(QMainWindow):
         self._consumable_low = sum(1 for item in self._consumables if item.get("low"))
         self._update_count_label()
 
-    def _visible_subset(self) -> list[DeviceInfo]:
+    def _visible_subset(self, include_channels: bool = False) -> list[DeviceInfo]:
         """当前家庭 + 房间筛选后的设备列表（统计与明细共用）。"""
-        visible = self._visible_devices()
+        visible = self._visible_devices(include_channels=include_channels)
         if self._current_home == _ALL_HOMES:
             return visible
         return [d for d in visible if d.home_name == self._current_home]
@@ -1555,17 +1573,43 @@ class MainWindow(QMainWindow):
             self._status_panel = None
             dlg.deleteLater()
 
-    def _show_env_detail(self) -> None:
-        rows = [
-            {
-                "device": d,
-                "state": self._known_power.get(d.did),
-                "metrics": self._metrics.get(d.did),
-                "icon": icon_store.icon_path(d.model),
-            }
-            for d in self._visible_subset() if self._metrics.get(d.did)
+    def _show_env_detail(self, kind: str = "temp") -> None:
+        """温度/湿度明细：只列该项有读数的设备，在线离线都列。
+
+        温度胶囊只列有温度的（纯湿度传感器不出现在温度列表里），反过来同理；
+        温湿度都有的设备两个列表都会出现。读数放右侧大字——卡片宽度装不下
+        "26.2°C 50%"。离线设备灰显并标注"离线"，保留最后一次读数。
+
+        先刷一轮再弹面板：在线设备显示当前值，读数回来时 _apply_metrics
+        会回填已经打开的面板，所以不必等网络。
+        """
+        is_temp = kind == "temp"
+        unit = "°C" if is_temp else "%"
+        label = "温度" if is_temp else "湿度"
+        devices = [
+            d for d in self._visible_subset(include_channels=True)
+            if unit in (self._metrics.get(d.did) or "")
         ]
-        self._open_status_panel("温湿度", f"{len(rows)} 台设备有读数", [("", rows)])
+        # 在线优先，其次按家庭/房间/名字，离线垫底
+        devices.sort(key=lambda d: (0 if d.online else 1, d.home_name,
+                                    d.room_name or "", d.name))
+        rows = []
+        for d in devices:
+            sub_parts = [d.home_name, d.room_name or "未分配"]
+            if not d.online:
+                sub_parts.append("离线")
+            rows.append({
+                "did": d.did,
+                "name": d.name,
+                "sub": " · ".join(sub_parts),
+                "value": self._metrics.get(d.did),
+                "icon": icon_store.icon_path(d.model),
+                "offline": not d.online,
+            })
+        self._refresh_metrics()
+        online = sum(1 for d in devices if d.online)
+        self._open_status_panel(
+            label, f"{len(rows)} 台设备有{label}读数 · {online} 台在线", [("", rows)])
 
     def _show_light_detail(self) -> None:
         by_room: dict[str, list[dict]] = {}
@@ -1737,15 +1781,15 @@ class MainWindow(QMainWindow):
             panel.update_power(did, state)
 
     def _refresh_metrics(self) -> None:
-        """为无开关能力的可见设备批量拉温湿度读数（副标题展示）。
+        """批量拉温湿度读数。
 
-        有开关的设备副标题保持纯房间名；温湿度计这类设备读 SI 标准
-        temperature/humidity 属性，读数失败静默跳过。
+        胶囊要"当前范围内在线设备的最小值"，明细面板要显示在线设备的
+        当前值，所以有开关能力的设备（空调）也要读——它们才是室温的
+        主要来源。卡片副标题是否显示仍由 _apply_metrics 按"有无开关能力"
+        决定，不受这里影响。
+        插座/净水器这类测的不是室温的机型在服务层就被筛掉。
         """
-        dids = [
-            d.did for d in self._visible_devices()
-            if self._known_power.get(d.did) is None
-        ]
+        dids = [d.did for d in self._visible_devices(include_channels=True)]
         if not dids:
             return
         self._jobs.submit(
@@ -1755,22 +1799,30 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_metrics(self, metrics: dict[str, str | None]) -> None:
+        online = {d.did: d.online for d in self._all_devices}
         dirty = False
         for did, text in metrics.items():
             if text:
                 if self._metrics.get(did) != text:
                     dirty = True
                 self._metrics[did] = text
-            elif did in self._metrics:
+            elif online.get(did) and did in self._metrics:
+                # 在线却读不到：确实没有读数了，清掉
                 self._metrics.pop(did, None)
                 dirty = True
+            # 离线设备保留最后一次读数：明细面板要能显示"离线 + 上次读数"
             card = self._cards.get(did)
-            if card is not None:
-                card.set_metrics(text)
+            if card is not None and self._known_power.get(did) is None:
+                # 有开关的设备副标题保持纯房间名，读数只在胶囊/明细里体现
+                card.set_metrics(self._metrics.get(did))
         if dirty and self._all_devices:
             device_cache.save(self._all_devices, self._known_power, self._metrics)
         self._maybe_localize_names()
         self._push_tray_metrics()
+        # 明细面板开着时把新读数回填进去（exec 的事件循环里回调仍会执行）
+        panel = getattr(self, "_status_panel", None)
+        if panel is not None and shiboken6.isValid(panel):
+            panel.update_metrics(dict(self._metrics))
         # 温湿度读数变了，顶栏胶囊要跟着更新
         self._update_count_label()
 
@@ -1801,14 +1853,19 @@ class MainWindow(QMainWindow):
         if self._all_devices:
             device_cache.save(self._all_devices, self._known_power, self._metrics)
 
-    def _visible_devices(self) -> list[DeviceInfo]:
+    def _visible_devices(self, include_channels: bool = False) -> list[DeviceInfo]:
+        """当前家庭/房间范围内可见的设备。
+
+        include_channels=True 时保留多通道父设备的子通道：它们不在网格里
+        单独成卡（合并展示），但读数仍是房间真实环境值，统计胶囊要用。
+        """
         return [
             d for d in self._all_devices
             if (self._current_home == _ALL_HOMES or d.home_name == self._current_home)
             and (self._current_room == _ALL_ROOMS or d.room_name == self._current_room)
             and (not self._hide_no_func or self._device_has_functions(d))
             # 合并展示时子通道不再单独成卡：它们归属父设备那张卡
-            and not (self._merge_channels and d.parent_did)
+            and (include_channels or not (self._merge_channels and d.parent_did))
         ]
 
     def _device_has_functions(self, device: DeviceInfo) -> bool:

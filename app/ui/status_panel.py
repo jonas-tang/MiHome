@@ -91,6 +91,7 @@ class StatusPanelDialog(OverlayDialog):
         self.setWindowTitle(title)
         # did -> 卡片：面板内点击开关后同步按钮状态
         self._cards: dict[str, DeviceCard] = {}
+        self._value_labels: dict[str, QLabel] = {}
 
         panel = self._panel
         panel.setFixedSize(_PANEL_W, _PANEL_H)
@@ -152,6 +153,7 @@ class StatusPanelDialog(OverlayDialog):
                         sub_widget.deleteLater()
                 layout.deleteLater()
         self._cards.clear()
+        self._value_labels.clear()
 
     def _build_rows(self) -> None:
         self._clear_rows()
@@ -217,6 +219,19 @@ class StatusPanelDialog(OverlayDialog):
         if card is not None:
             card.set_power_state(state)
 
+    def update_metrics(self, mapping: dict[str, str | None]) -> None:
+        """主窗口读到新温湿度后回填面板（卡片副标题或行式读数标签）。"""
+        for did, text in mapping.items():
+            if not text:
+                continue
+            card = self._cards.get(did)
+            if card is not None:
+                card.set_metrics(text)
+                continue
+            label = self._value_labels.get(did)
+            if label is not None:
+                label.setText(text)
+
     def _make_row(self, row: dict) -> QWidget:
         """耗材等非开关条目：图标 + 名称/副标题 + 右侧电量环。"""
         box = QFrame()
@@ -238,17 +253,23 @@ class StatusPanelDialog(OverlayDialog):
                     Qt.TransformationMode.SmoothTransformation))
         lay.addWidget(icon, 0, Qt.AlignmentFlag.AlignVCenter)
 
+        # 离线条目整行灰显：名称、副标题、读数一起降级，
+        # 与主页离线卡片的配色一致
+        offline = bool(row.get("offline"))
+        name_color = SiColors.OFFLINE_TEXT if offline else SiColors.TEXT_PRIMARY
+        sub_color = SiColors.OFFLINE_SUB if offline else SiColors.TEXT_SECONDARY
+
         text_col = QVBoxLayout()
         text_col.setSpacing(2)
         name = QLabel(row.get("name") or "")
         name.setStyleSheet(
-            f"color: {SiColors.TEXT_PRIMARY}; background: transparent;"
+            f"color: {name_color}; background: transparent;"
             " font-size: 10pt; font-weight: 600;")
         text_col.addWidget(name)
         sub = QLabel(row.get("sub") or "")
         sub.setWordWrap(True)
         sub.setStyleSheet(
-            f"color: {SiColors.TEXT_SECONDARY}; background: transparent;"
+            f"color: {sub_color}; background: transparent;"
             " font-size: 9pt;")
         text_col.addWidget(sub)
         lay.addLayout(text_col, stretch=1)
@@ -259,9 +280,12 @@ class StatusPanelDialog(OverlayDialog):
         elif row.get("value"):
             value = QLabel(row["value"])
             value.setStyleSheet(
-                f"color: {SiColors.THEME}; background: transparent;"
-                " font-size: 11pt; font-weight: 600;")
+                f"color: {SiColors.OFFLINE_TEXT if offline else SiColors.THEME};"
+                " background: transparent; font-size: 13pt; font-weight: 600;")
             lay.addWidget(value, 0, Qt.AlignmentFlag.AlignVCenter)
+            # 温湿度明细这类行式条目：面板开着时新读数要能原地刷新
+            if row.get("did"):
+                self._value_labels[row["did"]] = value
         return box
 
     def _apply_styles(self) -> None:

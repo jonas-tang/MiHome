@@ -45,6 +45,7 @@ auth.json
 
 # 本地设备缓存（包含设备列表、token 等）
 devices_cache.json
+product_names.json
 .mihome_cache/
 
 # 设备图标缓存（model -> 图标 URL 映射与图片文件）

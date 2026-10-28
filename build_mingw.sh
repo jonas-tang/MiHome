@@ -88,6 +88,19 @@ TRANS="$ROOT/.venv/Lib/site-packages/PySide6/translations"
 # 默认 8，可用环境变量覆盖：JOBS=6 bash build_mingw.sh
 JOBS="${JOBS:-8}"
 
+# 默认禁用 ccache：4.2.1 与 4.14.2 在这台机器上都会卡死（编译到 482/484
+# 时 ccache 进程存活但 CPU 不再增长，scons 报 Slow C compilation），
+# 新版也一样，说明是与本机文件保护/杀毒相关的环境问题，不是版本缺陷。
+# 需要试验时可显式开启：NUITKA_CCACHE_BINARY=/d/dev/ccache/.../ccache.exe
+NUITKA_CCACHE_BINARY="${NUITKA_CCACHE_BINARY:-}"
+if [ -n "$NUITKA_CCACHE_BINARY" ] && [ -x "$NUITKA_CCACHE_BINARY" ]; then
+    export NUITKA_CCACHE_BINARY
+    CCACHE_ARGS=""
+else
+    NUITKA_CCACHE_BINARY=""
+    CCACHE_ARGS="--disable-ccache"
+fi
+
 # 产物目录放在缓存里且**长期保留**，这里有三条铁律（改脚本时别破坏）：
 #   1. 不要删 $OUT_DIR —— 里面的 run.build/ 是 scons 的中间产物
 #      （生成的 .c/.o 与 .sconsign 签名库），删了就必须从零重编；
@@ -96,12 +109,22 @@ JOBS="${JOBS:-8}"
 # 另外 Nuitka 4.x 在 Windows 上会自动下载并挂上 ccache（--assume-yes-for-
 # downloads 允许它下载，产物在 .nuitka-cache/ccache），实测 484 个 .o
 # 全部 cache hit，C 编译这一阶段基本不花时间；所以不要再手工指定 CC。
-OUT_DIR="$NUITKA_CACHE_DIR/out"
+# 产物目录可用 MIHOME_BUILD_DIR 指到项目之外：ccache 每模块统计日志
+# （run.build/ccache-<pid>.txt）在这个目录里写，放在项目内时会被环境的
+# 文件保护层拦截，表现为"Permission denied"或 ccache 进程直接卡死。
+OUT_DIR="${MIHOME_BUILD_DIR:-$NUITKA_CACHE_DIR/out}"
 mkdir -p "$OUT_DIR"
 
 echo "[4/4] 开始编译（首次或改动较多时几分钟到十几分钟，改了少数模块会快很多）..."
 echo "      C 编译并发: $JOBS 路（可用 JOBS=N 覆盖）"
 BUILD_T0=$(date +%s)
+
+# ccache：Nuitka 自带的 4.2.1 在这台机器上不可靠——要么写不了每模块
+# 统计日志（ccache: error: Failed to write ...ccache-<pid>.txt: Permission
+# denied），要么直接卡死在某个文件上（进程存活、CPU 只有 1 秒，scons 报
+# Slow C compilation）。改用自己装的新版（D://dev//ccache，4.14 修了
+# Windows 上的这类问题）；机器上没有就直接禁用，保证能编出来。
+run_nuitka() {
 "$PY" -m nuitka run.py \
     --standalone \
     --enable-plugin=pyside6 \
@@ -119,6 +142,7 @@ BUILD_T0=$(date +%s)
     --noinclude-dlls=qt6datavisualization.dll \
     --noinclude-dlls=qt6pdf.dll \
     --jobs="$JOBS" \
+    $CCACHE_ARGS \
     --assume-yes-for-downloads \
     --output-dir="$OUT_DIR" \
     --output-filename=MiHome-Windows.exe \
@@ -126,7 +150,28 @@ BUILD_T0=$(date +%s)
     --product-version=0.4.0 \
     --file-version=0.4.0 \
     --copyright="Copyright (C) 2026 MiHome-Windows contributors" \
-    --mingw64 || { echo "[ERROR] 编译失败"; exit 1; }
+    --mingw64
+}
+
+NUITKA_LOG="$NUITKA_CACHE_DIR/nuitka-build.log"
+attempt=1
+while :; do
+    run_nuitka 2>&1 | tee "$NUITKA_LOG"
+    status=${PIPESTATUS[0]}
+    [ "$status" -eq 0 ] && break
+    # 两类瞬时失败：ccache 写日志被拒、并行编译抢在常量文件生成之前
+    # （报 __constants.h / __helpers.h 找不到，重跑一次文件已在，能接着编）
+    if [ "$attempt" -lt 3 ] && grep -qE "ccache: error: Failed to write|fatal error: __(constants|helpers)\.h" "$NUITKA_LOG"; then
+        echo "[WARN] 瞬时编译失败（ccache 写日志/生成文件未就绪），重试（第 $((attempt + 1)) 次）"
+        # 只挪不删：与旧产物同一策略，避免触发环境的安全转存
+        for stale in "$OUT_DIR"/run.build/ccache-*.txt; do
+            [ -e "$stale" ] && mv "$stale" "$ARCHIVE/" 2>/dev/null
+        done
+        attempt=$((attempt + 1))
+        continue
+    fi
+    echo "[ERROR] 编译失败"; exit 1
+done
 echo "      编译耗时 $(( $(date +%s) - BUILD_T0 ))s"
 
 # 交付形态是"dist 根目录下直接躺 exe"，而 Nuitka 把内容放在 run.dist。
