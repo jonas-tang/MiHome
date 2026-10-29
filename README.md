@@ -93,7 +93,18 @@ python -m venv .venv
 
 ## 构建可执行文件
 
-项目使用 **[Nuitka](https://nuitka.net/)** 将 Python 源码编译打包为原生 Windows 可执行文件（standalone 模式：把 Python 解释器、全部依赖与资源文件整合进一个免安装目录，最终产出 `dist\MiHome-Windows.exe`）。Nuitka 是真编译器——把代码编译为 C 再编译为机器码，而非 PyInstaller 式的"打包字节码"，这也是需要 VS Build Tools 的原因。
+默认可执行文件由 **[PyInstaller](https://pyinstaller.org/)** 打包（目录版 / onedir：把解释器、依赖与资源收进 `dist\`，产出 `dist\MiHome-Windows.exe` + `dist\_internal\`），一条命令约 **85 秒**：
+
+```bash
+bash build_pyi.sh          # 增量构建
+CLEAN=1 bash build_pyi.sh  # 丢弃 PyInstaller 缓存后重建
+```
+
+> 为什么不用单文件（`--onefile`）：每次启动都要把 ~90MB 解压到 `%TEMP%\_MEIxxxx`，
+> 启动慢 2 秒以上，强杀进程还会残留解压目录（实测几十次测试残留了 900MB+）。
+> 需要"一个文件分发"时用安装包（见下）而不是 onefile。
+
+**Nuitka 仍保留**为另一条路线（`build_mingw.sh` / `build.ps1`）：把 Python 编译成 C 再编译成机器码，启动更快、更难反编译，但要 VS Build Tools / MinGW，且**每次构建要编译 484 个 C 文件**——本机关掉 ccache 后需 9~13 分钟，适合发版而不是日常迭代。
 
 ### 前置条件
 
@@ -142,7 +153,7 @@ cd MiHome-Windows-Main
 构建参数（打包资源清单、图标、排除项等）集中维护在 `build.ps1` 的 `$NuitkaArgs`；
 `build_msvc.bat` 只是转发到它的双击入口。
 
-首次构建耗时较长（创建 venv + 下载依赖 + Nuitka 编译，通常 5–15 分钟，视机器而定）
+首次构建较慢（创建 venv + 下载依赖）；之后 PyInstaller 增量打包约 85 秒，Nuitka 约 9~13 分钟（无可用 ccache 时）
 
 
 

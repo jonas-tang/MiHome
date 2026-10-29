@@ -66,9 +66,13 @@ _SCENE_TAB = "场景"
 # 米家里没分到房间的设备：房间 tab 里不出现（点它没有意义），
 # 但「全屋」分组视图必须有个落点，否则这些设备会凭空消失
 _UNASSIGNED_ROOM = "未分配房间"
-# 首屏默认布局：一排正好 _DEFAULT_CARD_COLUMNS 个卡片，窗口整体 16:9
+# 首屏默认布局：一排正好 _DEFAULT_CARD_COLUMNS 个卡片，纵向露出 _DEFAULT_CARD_ROWS 行
 _DEFAULT_CARD_COLUMNS = 4
-_ASPECT_W, _ASPECT_H = 16, 9
+_DEFAULT_CARD_ROWS = 4
+# 状态胶囊行（温度/湿度/开启/耗材）在默认尺寸计算里的预留高度：胶囊 28 + 行距 8
+_STATUS_ROW_HEIGHT = 36
+# 段标题（"家 · 主卧 8 台"那一行）在默认尺寸计算里的预留高度
+_GROUP_HEADER_HEIGHT = 29
 # 与 setMinimumSize 的高度保持一致：16:9 反推宽度时不能低于它
 _WINDOW_MIN_HEIGHT = 460
 # 卡片网格的横纵间距：列数计算与默认窗口宽度都依赖它，改这里即可
@@ -2197,24 +2201,46 @@ class MainWindow(QMainWindow):
         # 不设单排上限——宽屏下应自然补列而不是拉开卡片间距
         return max(1, cols)
 
-    @staticmethod
-    def _default_window_size() -> tuple[int, int]:
-        """默认窗口逻辑尺寸：首屏一排正好 4 个卡片，整体 16:9。
+    def _default_window_size(self) -> tuple[int, int]:
+        """默认窗口逻辑尺寸：一排正好 4 个卡片，纵向露出 4 行卡片。
 
-        宽度先按"几张卡片并排"反推（与 _columns_for_width 同一套列宽/
-        间距/边距口径，再多留一个间距吸收取整与滚动条差异），再把宽高
-        一起取整到 16:9 的整数倍（宽 16k、高 9k）——这样比例是精确的
-        而不是 924×520 那种近似值，同时不低于窗口最小高度。
+        宽度按"几张卡片并排"反推（与 _columns_for_width 同一套列宽/间距/
+        边距口径，再多留一个间距吸收取整与滚动条差异）。
+
+        高度不再凑 16:9（那个比例下只能看到 2 行半卡片，纵向太憋），而是
+        按"网格里正好 4 行"算：先量出窗口里除网格以外的固定高度
+        （标题栏 + 页签行 + 状态胶囊 + 各层边距，即 chrome），再补上
+        4 行卡片和行间距。chrome 现场测量而不是写死常数——以后调整这几块
+        的高度，默认窗口会自动跟着变。
         """
-        from app.ui.device_card import _CARD_FIXED_WIDTH
+        from app.ui.device_card import _CARD_FIXED_HEIGHT, _CARD_FIXED_WIDTH
         spacing = _GRID_SPACING
         right_margin = 12
         content_margins = 24 * 2  # content 布局左右边距（构造处设置）
         eff = _DEFAULT_CARD_COLUMNS * (_CARD_FIXED_WIDTH + spacing) - spacing
-        needed = eff + right_margin + content_margins + spacing
-        # 向上取整的两种约束：装得下这么多卡片、高度不低于最小尺寸
-        k = max(-(-needed // _ASPECT_W), -(-_WINDOW_MIN_HEIGHT // _ASPECT_H))
-        return k * _ASPECT_W, k * _ASPECT_H
+        # 宽度取整到 16 的倍数：旧版默认宽 832 正是这么来的，改高度时宽度保持不变
+        width = -(-(eff + right_margin + content_margins + spacing) // 16) * 16
+
+        # 先给个足够高的临时尺寸并让布局生效，才能量到真实的 chrome
+        chrome = 188  # 兜底值（实测值），量不到时也安全
+        try:
+            self.resize(width, 600)
+            self.centralWidget().layout().activate()
+            measured = self.height() - self._scroll.viewport().height()
+            if measured > 0:
+                chrome = measured
+            # 启动瞬间还没有读数，状态胶囊是隐藏的，此时量到的 chrome 少了
+            # 一行胶囊（28 + 间距 8 = 36）。按"胶囊会显示"来算，避免数据
+            # 一加载网格就被挤掉半行。
+            if not (self._temp_pill.isVisible() or self._light_pill.isVisible()):
+                chrome += _STATUS_ROW_HEIGHT
+        except Exception:
+            pass
+        body = _DEFAULT_CARD_ROWS * (_CARD_FIXED_HEIGHT + spacing) - spacing
+        # 再留一个段标题的高度：全屋视图里每个房间一段，首屏要能看到
+        # "标题 + 4 行卡片"而不是 3 行半
+        height = max(chrome + body + _GROUP_HEADER_HEIGHT + 8, _WINDOW_MIN_HEIGHT)
+        return width, height
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt 命名约定)
         super().showEvent(event)

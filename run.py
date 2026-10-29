@@ -10,6 +10,17 @@ import os
 import sys
 import tempfile
 
+# PyInstaller 的 windowed 模式没有控制台：sys.stdout / sys.stderr 是 None，
+# 任何一句残留的 print（siui 第三方组件里有几处）都会炸成
+# "NoneType object has no attribute 'write'"，表现为**双击闪退、命令行启动正常**。
+# 这里先把缺失的流接到空设备上，再做后续导入。
+if sys.stdout is None or sys.stderr is None:
+    _devnull = open(os.devnull, "w", encoding="utf-8")
+    if sys.stdout is None:
+        sys.stdout = _devnull
+    if sys.stderr is None:
+        sys.stderr = _devnull
+
 from PySide6.QtCore import QLockFile, QTimer, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtNetwork import QLocalServer, QLocalSocket

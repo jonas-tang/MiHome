@@ -75,3 +75,5 @@ htmlcov/
 
 # ---- 本地 AI 工作区（会话记忆 / 临时探针，仅本机使用，绝不提交）----
 .workbuddy/
+.pyi-cache/
+.pyi-staged/

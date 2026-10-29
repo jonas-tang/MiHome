@@ -768,6 +768,11 @@ class MijiaService:
 
         不足判定与米家 App 一致：details.value 低于 details.inadeq.val。
         接口异常返回空列表，顶栏隐藏该项即可，不影响主流程。
+
+        注意 `details` 有两种形态：单耗材设备是一个对象，多耗材设备
+        （如门锁的电池仓、净水器的多级滤芯）是**数组**。早先只按对象处理，
+        遇到数组就是 `'list' object has no attribute 'get'`，异常一路抛到
+        后台任务把整轮耗材刷新打断，顶栏的耗材胶囊也跟着不更新。
         """
         try:
             raw_items = self._api.get_consumable_items()
@@ -776,28 +781,39 @@ class MijiaService:
             return []
         result: list[dict] = []
         for item in raw_items or []:
-            if item.get("is_ignore"):
+            if not isinstance(item, dict) or item.get("is_ignore"):
                 continue
-            detail = item.get("details") or {}
-            try:
-                value = float(detail.get("value"))
-            except (TypeError, ValueError):
+            details = item.get("details")
+            if isinstance(details, dict):
+                details = [details]
+            if not isinstance(details, list):
                 continue
-            try:
-                threshold = float(json.loads(detail.get("inadeq") or "{}").get("val"))
-            except (TypeError, ValueError):
-                threshold = None
-            result.append({
-                "did": str(item.get("did") or ""),
-                "name": str(item.get("name") or ""),
-                "model": str(item.get("model") or ""),
-                "description": str(detail.get("description") or ""),
-                "type": str(detail.get("type_name") or ""),
-                "value": value,
-                "threshold": threshold,
-                "low": threshold is not None and value < threshold,
-                "updated": int(detail.get("update_time") or 0),
-            })
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                try:
+                    value = float(detail.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    threshold = float(json.loads(detail.get("inadeq") or "{}").get("val"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    threshold = None
+                try:
+                    updated = int(detail.get("update_time") or 0)
+                except (TypeError, ValueError):
+                    updated = 0
+                result.append({
+                    "did": str(item.get("did") or ""),
+                    "name": str(item.get("name") or ""),
+                    "model": str(item.get("model") or ""),
+                    "description": str(detail.get("description") or ""),
+                    "type": str(detail.get("type_name") or ""),
+                    "value": value,
+                    "threshold": threshold,
+                    "low": threshold is not None and value < threshold,
+                    "updated": updated,
+                })
         return result
 
     def consumable_low_count(self) -> tuple[int, int]:
