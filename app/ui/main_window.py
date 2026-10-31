@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 _ALL_ROOMS = "全屋"
 _ALL_HOMES = "全部"
 # 场景选项卡：位于「全屋」左侧的特殊房间值，选中后网格切换为场景视图
-_SCENE_TAB = "场景"
+_SCENE_TAB = "智能"
 # 米家里没分到房间的设备：房间 tab 里不出现（点它没有意义），
 # 但「全屋」分组视图必须有个落点，否则这些设备会凭空消失
 _UNASSIGNED_ROOM = "未分配房间"
@@ -281,6 +281,11 @@ class MainWindow(QMainWindow):
         from app.core.settings_store import get_show_scene_tab
         self._show_scene_tab = get_show_scene_tab()
         self._scenes: list[SceneInfo] | None = None
+        # 自动化（米家「智能 → 自动化」）：与手动场景同一接口返回，
+        # 由触发条件驱动，不能手动执行
+        self._automations: list[SceneInfo] | None = None
+        # scene_id -> 触发条件文案（列表接口不带 trigger，按需查 GetSceneInfo）
+        self._trigger_cache: dict[str, str] = {}
         self._scene_cards: dict[str, SceneCard] = {}
         # 场景列表后台拉取防重入
         self._loading_scenes = False
@@ -1482,9 +1487,15 @@ class MainWindow(QMainWindow):
         # 在线圆点固定为米家绿：它是"在线状态"的语义色，不随主题色变
         online_dot = "#3dbba4"
         if self._current_room == _SCENE_TAB:
-            count = len(self._scenes or [])
+            scenes = len(self._scenes or [])
+            autos = len(self._automations or [])
+            parts = []
+            if scenes or not autos:
+                parts.append(f"{scenes} 个场景")
+            if autos:
+                parts.append(f"{autos} 个自动化")
             self._count_label.setText(
-                f'<span style="color:{muted}">共 {count} 个场景</span>')
+                f'<span style="color:{muted}">共 {" · ".join(parts)}</span>')
             for pill in (self._temp_pill, self._humidity_pill,
                          self._light_pill, self._consumable_pill):
                 pill.setVisible(False)
@@ -2098,7 +2109,7 @@ class MainWindow(QMainWindow):
             row += (len(devices) + cols - 1) // cols
         return row
 
-    def _make_room_header(self, title: str, count: int) -> QWidget:
+    def _make_room_header(self, title: str, count: int, unit: str = "台") -> QWidget:
         """分段标题：房间名 + 台数 + 一条延伸到右侧的细线。"""
         holder = QWidget()
         holder.setStyleSheet("background: transparent;")
@@ -2111,7 +2122,7 @@ class MainWindow(QMainWindow):
         name.setFont(QFont("Microsoft YaHei UI", 11, QFont.Weight.DemiBold))
         name.setStyleSheet(
             f"color: {SiColors.TEXT_PRIMARY}; background: transparent;")
-        count_label = QLabel(f"{count} 台")
+        count_label = QLabel(f"{count} {unit}")
         count_label.setStyleSheet(
             f"color: {SiColors.TEXT_MUTED}; background: transparent;"
             " font-size: 9pt;")
@@ -2154,11 +2165,15 @@ class MainWindow(QMainWindow):
         self._grid.addWidget(card, row, col)
 
     def _rebuild_scene_grid(self) -> None:
-        """场景视图网格：卡片尺寸与设备卡一致，列数换算直接复用。"""
+        """智能视图网格：上半部分是手动场景（可执行），下面是自动化列表。
+
+        两类条目尺寸一致（列数换算复用同一套），自动化不可执行，
+        卡片上不放运行按钮，只显示启用状态。
+        """
         scenes = sorted(self._scenes or [], key=lambda s: s.name)
-        if not scenes:
-            # 空状态：居中提示（含「确认无场景」与加载失败两种来源）
-            hint = QLabel("暂无场景，可在米家 APP「智能」中添加")
+        automations = sorted(self._automations or [], key=lambda s: s.name)
+        if not scenes and not automations:
+            hint = QLabel("暂无场景或自动化，可在米家 APP「智能」中添加")
             hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             hint.setFont(QFont("Microsoft YaHei UI", 12))
             hint.setStyleSheet(
@@ -2168,12 +2183,41 @@ class MainWindow(QMainWindow):
 
         cols = self._columns_for_width(self._scroll.viewport().width())
         self._grid_columns = cols
-        rows = (len(scenes) + cols - 1) // cols
-        for index, scene in enumerate(scenes):
+        index = 0
+        if automations and scenes:
+            header = self._make_room_header("手动场景", len(scenes), unit="个")
+            self._grid.addWidget(header, 0, 0, 1, cols)
+            index = cols
+        for scene in scenes:
             card = SceneCard(scene)
             card.executed.connect(self._on_scene_executed)
+            card.open_requested.connect(self._open_scene_detail)
             self._scene_cards[scene.scene_id] = card
             self._grid.addWidget(card, index // cols, index % cols)
+            index += 1
+
+        if automations:
+            # 与设备页一致：按家庭分区，家庭名放在段标题里，卡片内不再重复
+            by_home: dict[str, list[SceneInfo]] = {}
+            for auto in automations:
+                by_home.setdefault(auto.home_name or "未知家庭", []).append(auto)
+            for home_name in sorted(by_home):
+                group = by_home[home_name]
+                if index % cols:                     # 段标题独占新的一行
+                    index += cols - index % cols
+                header = self._make_room_header(
+                    f"自动化 · {home_name}", len(group), unit="个")
+                self._grid.addWidget(header, index // cols, 0, 1, cols)
+                index += cols
+                for auto in group:
+                    card = SceneCard(auto)
+                    card.open_requested.connect(self._open_scene_detail)
+                    card.enabled_toggled.connect(self._on_automation_toggled)
+                    self._scene_cards[auto.scene_id] = card
+                    self._grid.addWidget(card, index // cols, index % cols)
+                    index += 1
+
+        rows = (index + cols - 1) // cols
         self._finalize_grid(cols, rows)
 
     def _finalize_grid(self, cols: int, rows: int) -> None:
@@ -2395,16 +2439,23 @@ class MainWindow(QMainWindow):
         if self._loading_scenes:
             return
         self._loading_scenes = True
+        home = None if self._current_home == _ALL_HOMES else self._current_home
+
+        def fetch():
+            return (self._service.scene_list(home),
+                    self._service.automation_list(home))
+
         self._jobs.submit(
-            lambda: self._service.scene_list(
-                None if self._current_home == _ALL_HOMES else self._current_home),
+            fetch,
             on_success=self._on_scenes_loaded,
             on_error=self._on_scenes_failed,
         )
 
-    def _on_scenes_loaded(self, scenes: list[SceneInfo]) -> None:
+    def _on_scenes_loaded(self, result) -> None:
         self._loading_scenes = False
+        scenes, automations = result
         self._scenes = scenes
+        self._automations = automations
         if self._current_room == _SCENE_TAB:
             self._rebuild_grid()
             self._update_count_label()
@@ -2420,6 +2471,93 @@ class MainWindow(QMainWindow):
             self._show_status("场景加载失败", 4000)
         else:
             Toast.info(self, f"场景刷新失败：{error}", 4000)
+
+    def _on_automation_toggled(self, scene_id: str, enabled: bool) -> None:
+        """自动化卡片上的启停开关：后台写入，失败时把开关拨回去。"""
+        scene = self._find_scene(scene_id)
+        card = self._scene_cards.get(scene_id)
+        if scene is None:
+            return
+        if card is not None and shiboken6.isValid(card):
+            card.set_busy(True)      # 与设备开关一致：写入期间降一档并禁点
+        self._jobs.submit(
+            lambda s=scene, e=enabled: self._service.set_scene_enabled(s, e),
+            on_success=lambda _r, s=scene, e=enabled, c=card:
+                self._on_enabled_done(s, e, c),
+            on_error=lambda err, s=scene, c=card: self._on_enabled_failed(s, c, err),
+        )
+
+    def _on_enabled_done(self, scene: SceneInfo, enabled: bool, card) -> None:
+        scene.enabled = enabled
+        if card is not None and shiboken6.isValid(card):
+            card.set_busy(False)
+            card.set_enabled(enabled)
+        Toast.info(self, f"「{scene.name}」已{'启用' if enabled else '停用'}", 2000)
+
+    def _on_enabled_failed(self, scene: SceneInfo, card, error: Exception) -> None:
+        # 写失败必须把 UI 拨回真实状态，否则开关和云端不一致
+        if card is not None and shiboken6.isValid(card):
+            card.set_busy(False)
+            card.set_enabled(scene.enabled)
+        Toast.info(self, f"切换失败：{error}", 4000)
+
+    def _on_scene_renamed(self, scene_id: str, name: str) -> None:
+        scene = self._find_scene(scene_id)
+        if scene is None:
+            return
+        self._jobs.submit(
+            lambda s=scene, n=name: self._service.rename_scene(s, n),
+            on_success=lambda new_name, s=scene: self._on_renamed_done(s, new_name),
+            on_error=lambda err: Toast.info(self, f"改名失败：{err}", 4000),
+        )
+
+    def _on_renamed_done(self, scene: SceneInfo, new_name: str) -> None:
+        if self._current_room == _SCENE_TAB:
+            self._rebuild_grid()
+            self._update_count_label()
+        Toast.info(self, f"已重命名为「{new_name}」", 2000)
+
+    def _open_scene_detail(self, scene_id: str) -> None:
+        """点卡片空白处：展示这条场景/自动化会做什么。
+
+        自动化还要显示触发条件，而触发条件不在列表接口里（只有
+        GetSceneInfo 有），所以先查一次并缓存，再开面板。
+        """
+        scene = self._find_scene(scene_id)
+        if scene is None:
+            return
+        if not scene.is_automation:
+            self._show_scene_dialog(scene, "")
+            return
+        cached = self._trigger_cache.get(scene_id)
+        if cached is not None:
+            self._show_scene_dialog(scene, cached)
+            return
+        self._jobs.submit(
+            lambda s=scene: self._service.scene_trigger_text(s),
+            on_success=lambda text, s=scene: self._on_trigger_loaded(s, text or ""),
+            on_error=lambda _e, s=scene: self._on_trigger_loaded(s, ""),
+        )
+
+    def _on_trigger_loaded(self, scene: SceneInfo, text: str) -> None:
+        # 空串也缓存：读不到就别每次点都重试一遍
+        self._trigger_cache[scene.scene_id] = text
+        self._show_scene_dialog(scene, text)
+
+    def _show_scene_dialog(self, scene: SceneInfo, trigger_text: str) -> None:
+        from app.ui.scene_dialog import SceneDetailDialog
+
+        dialog = SceneDetailDialog(scene, self, trigger_text=trigger_text)
+        # 详情里的「执行场景」走与卡片圆钮同一条链路（含忙碌态与 Toast）
+        dialog.run_requested.connect(self._on_scene_executed)
+        dialog.save_requested.connect(self._on_scene_renamed)
+        dialog.exec()
+
+    def _find_scene(self, scene_id: str) -> SceneInfo | None:
+        for scene in (*(self._scenes or []), *(self._automations or [])):
+            if scene.scene_id == scene_id:
+                return scene
+        return None
 
     def _on_scene_executed(self, scene_id: str) -> None:
         scene = next((s for s in (self._scenes or []) if s.scene_id == scene_id), None)

@@ -7,7 +7,7 @@
 core.service 适配层，界面层永远只依赖这里的稳定类型。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -80,17 +80,43 @@ class DeviceDetail:
 
 
 @dataclass
+class SceneAction:
+    """场景里的一条动作，文案由 core.service 翻译好直接展示。
+
+    米家把每条动作存成 `{order, payload_json: {command, delay_time,
+    device_name, did, model, value: [{siid, piid, value}]}}`；
+    界面层不该再碰 siid/piid，所以这里只保留人话。
+    """
+
+    order: int = 0
+    delay: int = 0            # 执行前延时（秒），0 表示立即
+    did: str = ""             # 动作指向的设备（用于查当前设备名/图标）
+    # 设备显示名：优先用设备列表里的当前名称（与设备页一致），
+    # 米家场景里存的是**创建场景那一刻**的名字，改名后不会同步
+    device_name: str = ""
+    text: str = ""            # 如「开关 → 开」「亮度 → 60」
+    model: str = ""           # 设备型号，取图标用；空表示没有对应设备
+
+
+@dataclass
 class SceneInfo:
     """米家手动场景（米家 APP → 智能 → 手动控制 中创建的项）。
 
     home_id 是执行场景时上游 run_scene 所需的家庭 ID；
     home_name 为家庭显示名（卡片副标题用），为空表示归属未知。
+    actions 是这条场景会执行的动作明细（详情面板展示），
+    接口没给明细时为空列表。
     """
 
     scene_id: str
     name: str
     home_id: str
     home_name: str = ""
+    actions: list[SceneAction] = field(default_factory=list)
+    # 自动场景（米家里的"自动化"）：由触发条件驱动，不能手动执行；
+    # 手动场景（"手动控制"）才是点一下就跑的
+    is_automation: bool = False
+    enabled: bool = True
 
 
 def is_speaker(device: DeviceInfo) -> bool:

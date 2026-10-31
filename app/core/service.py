@@ -33,7 +33,8 @@ from mijiaAPI.devices import DevAction, DevProp
 from mijiaAPI.miutils import generate_enc_params, gen_nonce, get_signed_nonce
 
 from . import icon_store, product_name_store, spec_zh
-from .models import ActionInfo, DeviceDetail, DeviceInfo, PropInfo, SceneInfo
+from .models import (ActionInfo, DeviceDetail, DeviceInfo, PropInfo, SceneAction,
+                     SceneInfo)
 from .net_guard import install_default_timeout
 
 # 上游多处 HTTP 调用没有 timeout（登录取二维码、刷新 token、设备列表），
@@ -898,6 +899,18 @@ class MijiaService:
 
     def scene_list(self, home_name: str | None = None) -> list[SceneInfo]:
         """获取手动场景列表；home_name 为 None 时返回全部家庭的场景。"""
+        return self._scene_infos(home_name, "manual_scene_info_list", False)
+
+    def automation_list(self, home_name: str | None = None) -> list[SceneInfo]:
+        """获取自动场景（米家里的「自动化」）。
+
+        和手动场景同一个接口返回，只是列表字段不同（auto_scene_info_list）；
+        自动化由触发条件驱动、不能手动执行，所以卡片上不放运行按钮。
+        """
+        return self._scene_infos(home_name, "auto_scene_info_list", True)
+
+    def _scene_infos(self, home_name: str | None, key: str,
+                     is_automation: bool) -> list[SceneInfo]:
         home_id: str | None = None
         if home_name is not None:
             home_id = self._home_ids_map().get(home_name)
@@ -905,22 +918,473 @@ class MijiaService:
                 # 界面家庭名在映射里不存在（如「未知」），视为无场景
                 return []
         try:
-            scenes = self._api.get_scenes_list(home_id)
+            raw = self._raw_scene_lists(home_id)
         except Exception as exc:
             raise _wrap_error(exc, "获取场景列表失败") from exc
+        items = raw.get(key) or []
         id_to_name = {v: k for k, v in self._home_ids_map().items()}
         return [
             SceneInfo(
                 scene_id=str(s.get("scene_id") or ""),
-                name=str(s.get("name") or "未命名场景"),
+                name=str(s.get("name") or ("未命名自动化" if is_automation else "未命名场景")),
                 # 上游返回的 home_id 与请求一致，兜底用请求时的家庭 ID
                 home_id=str(s.get("home_id") or home_id or ""),
                 # 家庭显示名反查映射（「全部」路径下跨家庭场景各自归属）
                 home_name=id_to_name.get(
                     str(s.get("home_id") or home_id or ""), ""),
+                actions=self._scene_actions(s),
+                is_automation=is_automation,
+                enabled=bool(s.get("enable", True)),
             )
-            for s in scenes
+            for s in items
         ]
+
+    def _raw_scene_lists(self, home_id: str | None) -> dict:
+        """拉原始场景返回（手动/自动/语音三个列表都在里面）。
+
+        上游库只暴露了手动场景，但同一个接口用 get_type=2 请求时，
+        `auto_scene_info_list`（自动化）和 `voice_scene_info_list`（语音）
+        一并返回，早先被丢掉了。home_id 为 None 时逐家庭请求后合并，
+        并给每条补 home_id（上游只在单家庭请求时带）。
+        """
+        if home_id is not None:
+            return self._request_scene_list(home_id)
+        merged: dict[str, list] = {
+            "manual_scene_info_list": [], "auto_scene_info_list": [],
+            "voice_scene_info_list": [],
+        }
+        for hid in self._home_ids_map().values():
+            ret = self._request_scene_list(hid)
+            for key in merged:
+                for item in ret.get(key) or []:
+                    if isinstance(item, dict):
+                        item.setdefault("home_id", str(hid))
+                        merged[key].append(item)
+        return merged
+
+    def _request_scene_list(self, home_id: str) -> dict:
+        return self._api._request(
+            "/appgateway/miot/appsceneservice/AppSceneService/GetSimpleSceneList",
+            {"app_version": 12, "get_type": 2, "home_id": str(home_id),
+             "owner_uid": self._api._get_home_owner(home_id)}) or {}
+
+    def _raw_scene_info(self, scene_id: str, home_id: str) -> dict:
+        """场景/自动化的完整定义（含触发条件）。
+
+        列表接口不带 trigger，只有 GetSceneInfo 有；这条路已验证可用。
+        """
+        return self._api._request(
+            "/appgateway/miot/appsceneservice/AppSceneService/GetSceneInfo",
+            {"app_version": 12, "scene_id": str(scene_id), "home_id": str(home_id),
+             "owner_uid": self._api._get_home_owner(home_id)}) or {}
+
+    # ---------- 场景写操作（启停 / 改名） ----------
+
+    def _scene_edit_payload(self, scene: SceneInfo) -> dict:
+        """拿 Edit 接口需要的整份场景定义。
+
+        实测（2026-10-31）：`AppSceneService/Edit` 必须回传**完整对象**
+        （含 scene_action / scene_trigger / timewindow…），只传 scene_id +
+        要改的字段会返回 `{"code":-8,"msg":"invalid params"}`。
+        所以每次先读一次完整定义再改字段回写。
+        """
+        info = self._raw_scene_info(scene.scene_id, scene.home_id)
+        if not info.get("scene_id"):
+            raise ServiceError(f"未取到场景「{scene.name}」的定义，无法修改")
+        data = dict(info)
+        data.update({
+            "app_version": 12,
+            "scene_id": str(scene.scene_id),
+            "home_id": str(scene.home_id),
+            "owner_uid": self._api._get_home_owner(scene.home_id),
+        })
+        return data
+
+    def _scene_edit(self, scene: SceneInfo, **changes) -> None:
+        data = self._scene_edit_payload(scene)
+        data.update(changes)
+        try:
+            self._api._request(
+                "/appgateway/miot/appsceneservice/AppSceneService/Edit", data)
+        except Exception as exc:
+            raise _wrap_error(exc, f"修改「{scene.name}」失败") from exc
+
+    def set_scene_enabled(self, scene: SceneInfo, enabled: bool) -> None:
+        """启用/停用场景或自动化。"""
+        self._scene_edit(scene, enable=bool(enabled))
+        scene.enabled = bool(enabled)
+
+    def rename_scene(self, scene: SceneInfo, name: str) -> str:
+        """改名；返回去掉首尾空白后的新名称。"""
+        cleaned = (name or "").strip()
+        if not cleaned:
+            raise ServiceError("名称不能为空")
+        if cleaned == scene.name:
+            return cleaned
+        self._scene_edit(scene, name=cleaned)
+        scene.name = cleaned
+        return cleaned
+
+    def scene_trigger_text(self, scene: SceneInfo) -> str:
+        """自动化的触发条件（如「Ai 智能三键开关 · 中键打开时」）。
+
+        列表接口不返回 trigger，只有 GetSceneInfo 有；每条场景一次请求，
+        调用方应缓存（见主窗口的 _trigger_cache）。
+        """
+        try:
+            info = self._raw_scene_info(scene.scene_id, scene.home_id)
+        except Exception:
+            logger.debug("读取场景触发条件失败 scene_id=%s", scene.scene_id, exc_info=True)
+            return ""
+        triggers = (info.get("scene_trigger") or {}).get("triggers") or []
+        parts = []
+        for trig in triggers:
+            if not isinstance(trig, dict):
+                continue
+            src = str(trig.get("src") or "")
+            name = str(trig.get("name") or "").strip()
+            if src == "user":
+                parts.append("手动触发")
+                continue
+            device_name = ""
+            try:
+                extra = json.loads(trig.get("extra") or "{}")
+                device_name = str(extra.get("device_name") or "")
+                # 触发条件里同样存的是旧名字，能按 did 纠正就纠正
+                did = str(extra.get("did") or "")
+                if did:
+                    device_name = self._device_name_map().get(did) or device_name
+            except (TypeError, ValueError, json.JSONDecodeError):
+                device_name = ""
+            if device_name and name:
+                parts.append(f"{device_name} · {name}")
+            elif name:
+                parts.append(name)
+            elif device_name:
+                parts.append(device_name)
+            elif trig.get("key"):
+                parts.append(str(trig["key"]))
+        return "、".join(parts)
+
+    # ---------- 场景动作明细 ----------
+
+    def _device_name_map(self) -> dict[str, str]:
+        """did -> 当前显示名，口径与设备页完全一致。
+
+        设备页显示的名字来自两步本地化（见主窗口 _localize_names）：
+        1. `localized_product_names`：spec 里的中文产品名；
+        2. `cached_product_page_names`：产品页抓到的名称（覆盖前者）。
+        场景动作里存的 device_name 是**建场景那一刻**的英文原名，改名后
+        不会同步，所以这里重建一份与设备页同源的映射来纠正。
+        """
+        cached = getattr(self, "_name_map_cache", None)
+        if cached is not None:
+            return cached
+        devices = self._all_devices_cache()
+        names = {d.did: d.name for d in devices}
+        try:
+            names.update(self.localized_product_names(list(names), names))
+            ascii_devices = [d for d in devices if d.name.isascii() and d.model]
+            model_to_did = {d.model: d.did for d in ascii_devices}
+            if model_to_did:
+                for model, product_name in self.cached_product_page_names(
+                        sorted(model_to_did)).items():
+                    did = model_to_did.get(model)
+                    if did:
+                        names[did] = product_name
+        except Exception:
+            logger.debug("构建设备显示名映射失败，退回云端名称", exc_info=True)
+        self._name_map_cache = names
+        return names
+
+    def _scene_actions(self, scene: dict) -> list[SceneAction]:
+        """把一条场景的 scene_action.actions 翻成可直接展示的动作列表。
+
+        米家列表接口（GetSimpleSceneList）本身就把动作明细带回来了，
+        早期只取了 id/name 丢掉了这部分。结构形如：
+
+            {"order": 1, "payload_json": {
+                "command": "set_properties", "delay_time": 0,
+                "device_name": "大门", "did": "...", "model": "wfxx.motor.ycmkq",
+                "value": [{"did": "...", "siid": 3, "piid": 2, "value": 2}]}}
+
+        翻译失败的条目保留原始 command 文案——宁可难看，也不能让用户
+        以为这条场景什么都没做。
+        """
+        raw_actions = (scene.get("scene_action") or {}).get("actions") or []
+        result: list[SceneAction] = []
+        for raw in raw_actions:
+            if not isinstance(raw, dict):
+                continue
+            payload = raw.get("payload_json") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            try:
+                delay = int(payload.get("delay_time") or 0)
+            except (TypeError, ValueError):
+                delay = 0
+            model = str(payload.get("model") or "")
+            did = str(payload.get("did") or "")
+            # 通知类动作没有设备，单独给个名字，否则详情里显示成"设备"
+            is_notify = not str(payload.get("command") or "") and (
+                payload.get("title") or payload.get("desc"))
+            result.append(SceneAction(
+                order=int(raw.get("order") or 0),
+                delay=delay,
+                did=did,
+                # 米家把设备名**冗余存在动作里**，改名后不同步：
+                # 设备列表里的当前名字才是设备页显示的那个
+                device_name=("通知" if is_notify else
+                             (self._device_name_map().get(did)
+                              or str(payload.get("device_name") or ""))),
+                text=self._scene_action_text(payload, did, model),
+                model=model,
+            ))
+        result.sort(key=lambda a: a.order)
+        return result
+
+    def _scene_action_text(self, payload: dict, did: str, model: str) -> str:
+        """单条动作的中文描述；识别不了就退回原始 command。
+
+        米家里有**两种**动作写法，都会出现在手动场景中：
+
+        1. 新式 `set_properties` + `value: [{siid, piid, value}]`（多数设备）
+        2. 旧式命令名 + 字符串值，如 `{"command": "set_power", "value": "on"}`、
+           `{"command": "set_mode", "value": "cooling"}`（老款空调 zhimi 系）
+
+        第 2 种如果不翻译，详情页里就是一行 `set_spd_level`，等于没说。
+        这里把命令名映射回规格属性，再复用同一套值翻译。
+        """
+        command = str(payload.get("command") or "")
+        if not command:
+            title = str(payload.get("title") or "").strip()
+            desc = str(payload.get("desc") or "").strip()
+            if title or desc:
+                body = f"{title}：{desc}" if title and desc else (title or desc)
+                return f"发送通知「{body}」"
+            return "未知动作"
+        if command == "set_properties":
+            parts = []
+            for entry in payload.get("value") or []:
+                if not isinstance(entry, dict):
+                    continue
+                siid = entry.get("siid")
+                piid = entry.get("piid")
+                value = entry.get("value")
+                name, value_text = self._scene_prop_text(did, model, siid, piid, value)
+                # value_text 为空 = 只写属性（一次性命令），只显示名称，
+                # 不能拼成 "开/关 → "
+                if name and value_text:
+                    parts.append(f"{name} → {value_text}")
+                elif name:
+                    parts.append(name)
+                else:
+                    parts.append(value_text or "未知动作")
+            return "、".join(parts) if parts else "设置属性"
+        if command in ("action", "run_action", "execute_action"):
+            # 这类动作的 value 是一个对象（不是数组）：
+            # {"aiid": 1, "did": "...", "in": [], "siid": 2}
+            # 早先只从 payload 顶层取 siid/aiid，取不到就退化成
+            # "action → {'aiid': 1, ...}" 这种原始 dict，等于没解析
+            value = payload.get("value")
+            target_did = did
+            siid = payload.get("siid")
+            aiid = payload.get("aiid")
+            if isinstance(value, dict):
+                siid = value.get("siid", siid)
+                aiid = value.get("aiid", aiid)
+                target_did = str(value.get("did") or did)
+            name = self._scene_action_name(target_did, model, siid, aiid)
+            # toggle 类动作直接读作「开/关」，与米家 App 一致，
+            # 不再包一层「执行「…」」
+            if name in ("开关状态切换", "切换", "开/关"):
+                return "开/关"
+            return f"执行「{name}」" if name else "执行设备动作"
+
+        name, value_text = self._scene_command_text(did, model, command,
+                                                    payload.get("value"))
+        if value_text:
+            return f"{name} → {value_text}"
+        return name or command or "未知动作"
+
+    def _scene_command_text(self, did: str, model: str, command: str,
+                            value) -> tuple[str, str]:
+        """旧式命令名（set_power/set_mode…）→ (中文属性名, 值文本)。"""
+        zh = _SCENE_COMMAND_ZH.get(command)
+        prop = None
+        for prop_name in _SCENE_COMMAND_PROPS.get(command, ()):
+            prop = self._scene_prop_by_name(did, model, prop_name)
+            if prop is not None:
+                if not zh:
+                    desc = str(prop.get("description") or "")
+                    zh = spec_zh.prop_desc_zh(str(prop.get("name") or ""), desc)
+                    zh = zh.split(" / ")[-1] if " / " in zh else zh
+                break
+        if zh is None:
+            # 不认识的命令名：去掉 set_ 前缀、下划线换空格，
+            # 至少比直接把 set_xxx_yyy 摔给用户好读
+            zh = command[4:].replace("_", " ") if command.startswith("set_") else command
+        if value is None or value == "":
+            return zh, ""
+        if prop is not None:
+            return zh, self._enum_value_text(prop, value)
+        text = str(value).strip()
+        return zh, _SCENE_VALUE_ZH.get(text.lower(), text)
+
+    def _scene_prop_by_name(self, did: str, model: str, name: str) -> dict | None:
+        """按属性名找规格定义（规格里可能带数字后缀，如 fan-level-2）。"""
+        info = self._scene_spec(did, model)
+        if not info:
+            return None
+        for prop in info.get("properties", []):
+            prop_name = str(prop.get("name") or "")
+            if prop_name == name or prop_name.startswith(name + "-"):
+                return prop
+        return None
+
+    def _enum_value_text(self, prop: dict, value) -> str:
+        """属性值 → 可读文本：bool 开关、枚举描述、数值补单位。"""
+        prop_type = str(prop.get("type") or "")
+        text = str(value).strip()
+        low = text.lower()
+        if prop_type == "bool" or low in ("on", "off", "true", "false"):
+            return "开" if low in ("on", "true", "1") else "关"
+        entries = prop.get("value-list") or []
+        for item in entries:
+            if str(item.get("value")) == text:
+                return self._enum_desc(item) or text
+        # 旧式命令给的是枚举的英文名（"cooling"），按描述前半段反查
+        for item in entries:
+            desc = str(item.get("description") or "")
+            en = desc.split(" / ")[0].strip().lower().replace(" ", "-")
+            if en and (en == low or low in en.split("-") or en.startswith(low)):
+                return self._enum_desc(item) or text
+        if self._looks_number(text):
+            return text + _scene_prop_unit(str(prop.get("name") or ""))
+        return _SCENE_VALUE_ZH.get(low, text)
+
+    @classmethod
+    def _enum_desc(cls, item: dict) -> str:
+        """枚举条目的中文；只有英文描述时按兜底表转（如 Set → 触发）。"""
+        text = str(item.get("desc_zh_cn") or item.get("description") or "")
+        text = text.split(" / ")[-1] if " / " in text else text
+        text = text.strip()
+        if not text or any("\u4e00" <= ch <= "\u9fff" for ch in text):
+            return text
+        mapped = _SCENE_VALUE_ZH.get(text.lower())
+        if mapped:
+            return mapped
+        # 风速档位这类英文枚举：Level5 / Level 5 → 5 档
+        match = re.fullmatch(r"level\s*(\d+)", text.lower())
+        if match:
+            return f"{match.group(1)} 档"
+        return text
+
+    @staticmethod
+    def _looks_number(text: str) -> bool:
+        try:
+            float(text)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _scene_prop_text(self, did: str, model: str, siid, piid,
+                         value) -> tuple[str, str]:
+        """(属性中文名, 值的可读文本)。
+
+        属性名走设备规格（与设备详情页同一套中文映射），值按类型翻译：
+        bool → 开/关，带枚举 → 枚举描述，其余原样。
+        """
+        prop = self._scene_prop(did, model, siid, piid)
+        if prop is None:
+            return "", str(value)
+        prop_name = str(prop.get("name") or "")
+        # 只写属性 = 一次性命令（light 的 scene 服务：toggle / brightness-add…），
+        # 值 true 只是"触发"，不能显示成 "→ 开"
+        if prop_name in _SCENE_PROP_ZH:
+            return _SCENE_PROP_ZH[prop_name], ""
+        if str(prop.get("rw") or "") == "w" and str(prop.get("type")) == "bool":
+            desc_w = str(prop.get("description") or "")
+            zh_w = spec_zh.prop_desc_zh(prop_name, desc_w)
+            return (zh_w.split(" / ")[-1] if " / " in zh_w else zh_w), ""
+
+        desc = str(prop.get("description") or "")
+        # 描述统一是「英文 / 中文」，取中文段；spec_zh 兜底补中文
+        name = spec_zh.prop_desc_zh(prop_name, desc)
+        name = name.split(" / ")[-1] if " / " in name else name
+        # 「按键2状态」这类射频控制器通道：去掉"状态"二字，
+        # 详情里读作「按键2 → 触发」，比「按键2状态 → 触发」顺
+        name = re.sub(r"^(按键\s*\d+)状态$", r"\1", name)
+        return name, self._enum_value_text(prop, value)
+
+    def _scene_spec(self, did: str, model: str) -> dict | None:
+        """动作所属设备的规格。
+
+        只有 did 确实在设备索引里才走 `_specs_for`——它对未知 did 会触发
+        一次完整的设备列表刷新，而场景里常留着已删除设备的 did，
+        逐条动作都刷一遍会白打十几次请求。did 失效时按型号兜底。
+        """
+        info = None
+        if not self._device_index:
+            # 首次调用时索引还是空的，先补一次（内部会走设备列表接口）
+            self._refresh_device_index()
+        if did and did in self._device_index:
+            info = self._specs_for([did]).get(did)
+        if info is None and model:
+            info = self._spec_by_model(model)
+        return info
+
+    def _scene_prop(self, did: str, model: str, siid, piid) -> dict | None:
+        """按 siid/piid 在设备规格里找属性定义。"""
+        info = self._scene_spec(did, model)
+        if not info:
+            return None
+        for prop in info.get("properties", []):
+            method = prop.get("method") or {}
+            if (str(method.get("siid")) == str(siid)
+                    and str(method.get("piid")) == str(piid)):
+                return prop
+        return None
+
+    def _scene_action_name(self, did: str, model: str, siid, aiid) -> str:
+        info = self._scene_spec(did, model)
+        if not info:
+            return ""
+        for act in info.get("actions", []):
+            method = act.get("method") or {}
+            if (str(method.get("siid")) == str(siid)
+                    and str(method.get("aiid")) == str(aiid)):
+                desc = str(act.get("description") or "")
+                name = spec_zh.action_desc_zh(str(act.get("name") or ""), desc)
+                return name.split(" / ")[-1] if " / " in name else name
+        return ""
+
+    def _spec_by_model(self, model: str) -> dict | None:
+        """按型号取规格：场景里的 did 失效时（设备被删/换过）的兜底。"""
+        cached = getattr(self, "_model_specs", None)
+        if cached is None:
+            cached = {}
+            self._model_specs = cached
+        if model in cached:
+            return cached[model]
+        info = None
+        for device in self._all_devices_cache():
+            if device.model == model:
+                info = self._specs_for([device.did]).get(device.did)
+                break
+        cached[model] = info
+        return info
+
+    def _all_devices_cache(self) -> list[DeviceInfo]:
+        cached = getattr(self, "_device_list_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            cached = self.list_devices()
+        except Exception:
+            cached = []
+        self._device_list_cache = cached
+        return cached
 
     def run_scene(self, scene: SceneInfo) -> None:
         """执行手动场景；上游返回值为假视为失败。"""
@@ -1124,6 +1588,83 @@ def _ambient_range_ok(rng) -> bool:
         return float(rng[1]) <= 150
     except (TypeError, ValueError):
         return True
+
+
+# 旧式场景命令名 → 中文。米家老款设备（如 zhimi 系空调）的手动场景
+# 存的是 `{"command": "set_mode", "value": "cooling"}` 这种命令名 + 字符串值，
+# 和新式的 set_properties + siid/piid 不是一套，必须单独翻。
+_SCENE_COMMAND_ZH = {
+    "set_power": "开关",
+    "set_vertical": "上下摆风",
+    "set_horizontal": "左右摆风",
+    "set_mode": "模式",
+    "set_spd_level": "风速",
+    "set_comfort": "舒适模式",
+    "set_temp": "设定温度",
+    "set_temperature": "设定温度",
+    "set_bright": "亮度",
+    "set_brightness": "亮度",
+    "set_volume": "音量",
+    "set_color_temp": "色温",
+    "toggle": "开/关",
+}
+
+# 命令名 → 规格里的属性名：能把枚举值也翻成中文就翻。
+# 找不到对应属性时只用上面的中文名 + 值原文兜底。
+_SCENE_COMMAND_PROPS = {
+    "set_power": ("on",),
+    "set_vertical": ("vertical-swing",),
+    "set_horizontal": ("horizontal-swing",),
+    "set_mode": ("mode",),
+    "set_spd_level": ("fan-level", "speed-level"),
+    "set_comfort": ("comfort-mode",),
+    "set_temp": ("target-temperature", "temperature"),
+    "set_temperature": ("target-temperature", "temperature"),
+    "set_bright": ("brightness",),
+    "set_volume": ("volume",),
+    "set_color_temp": ("color-temperature",),
+}
+
+# 米家灯/开关类设备的 `scene` 服务属性：只写（access=write）、bool，
+# 值恒为 true，表示"触发一次"而非"设为开"。名称由规格里是空的，
+# 不单独翻译就会显示成 "toggle → 开"。
+_SCENE_PROP_ZH = {
+    "toggle": "开/关",
+    "brightness-add": "亮度 +",
+    "brightness-dec": "亮度 −",
+    "brightness-sw": "亮度循环",
+    "on-or-brightness": "开灯 / 调亮度",
+    "colortemperature-add": "色温 +",
+    "colortemperature-dec": "色温 −",
+    "colortemperature-sw": "色温循环",
+    "on-or-colortemp": "开灯 / 调色温",
+}
+
+
+# 查不到中文描述时的兜底：这些枚举名直接给中文
+_SCENE_VALUE_ZH = {
+    "on": "开", "off": "关", "true": "开", "false": "关",
+    "cooling": "制冷", "heating": "制热", "auto": "自动",
+    "dehumidify": "除湿", "dry": "除湿", "fan": "送风",
+    # 门锁/电机这类"按键状态"属性只有英文描述（Set/Reset），
+    # 在场景里表示"触发这个按键"
+    "set": "触发", "reset": "复位", "none": "无",
+}
+
+
+def _scene_prop_unit(name: str) -> str:
+    """数值型属性的单位后缀（温度 °C、色温 K、亮度音量 %、风速档）。"""
+    lowered = name.lower().replace("-", "")
+    # 色温是开尔文，不能跟着 "temperature" 一起当成摄氏度
+    if "colortemperature" in lowered:
+        return "K"
+    if "temperature" in lowered:
+        return "°C"
+    if lowered in ("brightness", "volume"):
+        return "%"
+    if "fanlevel" in lowered or "speedlevel" in lowered:
+        return " 档"
+    return ""
 
 
 def format_metrics_text(temp, hum) -> str | None:
